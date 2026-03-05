@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.7
+
+FROM golang:1.24-alpine AS analyzer-build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/service ./cmd/job-analyzer
+
+FROM ubuntu:22.04 AS llama-build
+ARG LLAMA_CPP_REF=master
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates git cmake build-essential \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN git clone --depth 1 --branch "${LLAMA_CPP_REF}" https://github.com/ggml-org/llama.cpp.git
+WORKDIR /build/llama.cpp
+RUN cmake -S . -B build \
+      -DGGML_NATIVE=ON \
+      -DGGML_OPENMP=ON \
+      -DLLAMA_BUILD_SERVER=ON \
+      -DBUILD_SHARED_LIBS=OFF \
+ && cmake --build build --target llama-server -j"$(nproc)"
+
+FROM ubuntu:22.04
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates tzdata wget curl libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=analyzer-build /out/service /app/service
+COPY --from=llama-build /build/llama.cpp/build/bin/llama-server /app/llama-server
+COPY configs /app/configs
+COPY scripts/start-analyzer-llama.sh /app/start-analyzer-llama.sh
+RUN chmod +x /app/start-analyzer-llama.sh /app/llama-server
+ENTRYPOINT ["/app/start-analyzer-llama.sh"]

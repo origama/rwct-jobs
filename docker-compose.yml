@@ -1,0 +1,138 @@
+services:
+  llm-mock:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: llm-mock
+    container_name: rwct-llm-mock
+    profiles: ["dev"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/healthz | grep -q ok"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  test-rss:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: test-rss
+    container_name: rwct-test-rss
+    profiles: ["dev", "prod"]
+    environment:
+      TEST_RSS_PORT: 8095
+      TEST_RSS_BASE_URL: http://test-rss:8095
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8095/healthz | grep -q ok"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  llama-cpp:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: rwct-llama-cpp
+    profiles: ["standalone-llama"]
+    command: ["-m", "/models/${LLM_MODEL_FILE}", "--host", "0.0.0.0", "--port", "8080", "-c", "2048", "-ngl", "0", "-t", "4"]
+    volumes:
+      - ${LLM_MODELS_DIR:-./models}:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || curl -fsS http://localhost:8080/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  rss-reader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: rss-reader
+    container_name: rwct-rss-reader
+    profiles: ["dev", "prod"]
+    env_file: .env
+    environment:
+      HEALTH_PORT: 8081
+      RSS_POLL_INTERVAL: 1m
+    depends_on:
+      test-rss:
+        condition: service_healthy
+    volumes:
+      - rwct-data:/data
+      - ./configs:/app/configs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8081/healthz | grep -q ok"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  job-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile.analyzer-llama
+    profiles: ["dev", "prod"]
+    env_file: .env
+    environment:
+      HEALTH_PORT: 8082
+      LLM_ENDPOINT: http://127.0.0.1:8080
+      LLAMA_HOST: 0.0.0.0
+      LLAMA_PORT: 8080
+      LLAMA_CTX: 2048
+      LLAMA_NGL: 0
+      LLAMA_THREADS: 4
+    volumes:
+      - rwct-data:/data
+      - ./configs:/app/configs:ro
+      - ${LLM_MODELS_DIR:-./models}:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8082/healthz | grep -q ok"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  message-dispatcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: message-dispatcher
+    container_name: rwct-message-dispatcher
+    profiles: ["dev", "prod"]
+    env_file: .env
+    environment:
+      HEALTH_PORT: 8083
+      DESTINATION_MODE: ${DESTINATION_MODE:-file}
+    volumes:
+      - rwct-data:/data
+      - ./configs:/app/configs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8083/healthz | grep -q ok"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  web-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: web-admin
+    container_name: rwct-web-admin
+    profiles: ["dev", "prod"]
+    env_file: .env
+    environment:
+      WEB_ADMIN_PORT: ${WEB_ADMIN_PORT:-8090}
+    ports:
+      - "${WEB_ADMIN_PORT:-8090}:${WEB_ADMIN_PORT:-8090}"
+    volumes:
+      - rwct-data:/data
+      - ./configs:/app/configs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:${WEB_ADMIN_PORT:-8090}/healthz | grep -q ok"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  rwct-data:

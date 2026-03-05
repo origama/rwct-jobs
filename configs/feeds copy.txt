@@ -1,0 +1,8 @@
+# Candidate remote job feeds (validated 2026-03-04)
+http://test-rss:8095/feed.rss
+https://weworkremotely.com/remote-jobs.rss
+https://weworkremotely.com/categories/remote-full-stack-programming-jobs.rss
+https://remotive.com/remote-jobs/feed
+https://remotive.com/remote-jobs/feed/software-development
+https://jobicy.com/feed/job_feed
+https://jobspresso.co/feed/

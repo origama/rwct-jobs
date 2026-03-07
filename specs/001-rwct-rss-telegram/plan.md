@@ -111,6 +111,17 @@ Payload policy:
 5. Test layer: unit + queue semantics/requeue + e2e pipeline.
 6. Hardening: retention cleanup, logging consistency, docs quickstart.
 
+## Next Implementation Backlog
+
+1. Centralizzare schema/migrazioni SQLite e DSN condiviso tra `rss-reader`, `job-analyzer`, `message-dispatcher`, `web-admin`.
+2. Proteggere `web-admin` per utilizzo non locale con auth minima o esposizione limitata/documentata.
+3. Rifattorizzare i file monolitici dei servizi, in particolare `internal/webadmin/service.go`, separando HTTP, SQL e UI assets.
+4. Estrarre bootstrap e validazione config/env in un package condiviso, eliminando `MustEnv*` con `panic`.
+5. Uniformare lifecycle operativo: health server chiudibile, telemetry dev/prod e shutdown coerente.
+6. Rendere esplicita e supportata la configurazione della modalita` `thinking` del modello nell'analyzer.
+7. Ridurre query N+1 nel `web-admin` usando query aggregate.
+8. Allineare le capability configurabili alle feature effettivamente implementate, in particolare sulla concorrenza analyzer.
+
 ## Complexity Tracking
 
 | Violation | Why Needed | Simpler Alternative Rejected Because |

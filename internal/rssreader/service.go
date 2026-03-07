@@ -771,7 +771,7 @@ func (s *Service) addFeed(feedURL string) error {
 	}
 	_, err := s.db.Exec(
 		`INSERT INTO rss_feeds(feed_url, enabled, created_at, updated_at) VALUES(?,1,?,?)
-ON CONFLICT(feed_url) DO UPDATE SET enabled=1, updated_at=excluded.updated_at`,
+ON CONFLICT(feed_url) DO UPDATE SET updated_at=excluded.updated_at`,
 		feedURL,
 		time.Now().UTC(),
 		time.Now().UTC(),

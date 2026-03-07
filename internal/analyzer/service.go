@@ -56,6 +56,7 @@ type Config struct {
 	LLMModel          string
 	LLMTimeout        time.Duration
 	LLMMaxTokens      int
+	LLMThinking       bool
 	MaxConcurrency    int
 	MaxJobsPerMin     int
 	RetryAttempts     int
@@ -549,6 +550,9 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 		},
 		"temperature": 0.1,
 		"max_tokens":  maxTokens,
+	}
+	if s.cfg.LLMThinking {
+		reqBody["enable_thinking"] = true
 	}
 	body, _ := json.Marshal(reqBody)
 

@@ -78,6 +78,19 @@ type ratioPoint struct {
 	Ratio      *float64 `json:"ratio"`
 }
 
+type analyzerRuntimeRow struct {
+	Name              string `json:"name"`
+	Model             string `json:"model"`
+	Endpoint          string `json:"endpoint"`
+	Timeout           string `json:"timeout"`
+	MaxTokens         int    `json:"max_tokens"`
+	ThinkingEnabled   bool   `json:"thinking_enabled"`
+	MaxConcurrency    int    `json:"max_concurrency"`
+	MaxJobsPerMin     int    `json:"max_jobs_per_min"`
+	QueuePollInterval string `json:"queue_poll_interval"`
+	LeaseDuration     string `json:"lease_duration"`
+}
+
 var unsafeNameRe = regexp.MustCompile(`[^a-z0-9]+`)
 
 func New(cfg Config) (*Service, error) {
@@ -286,6 +299,7 @@ func (s *Service) Run(ctx context.Context) error {
 	mux.HandleFunc("/api/db/items/analyzed", s.handleItemAnalyzedVersion)
 	mux.HandleFunc("/api/db/items/status", s.handleItemStatus)
 	mux.HandleFunc("/api/monitor/queues", s.handleQueueMonitor)
+	mux.HandleFunc("/api/runtime/analyzers", s.handleAnalyzerRuntime)
 
 	s.http = &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.cfg.HTTPPort),
@@ -885,6 +899,28 @@ func (s *Service) handleQueueMonitor(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Service) handleAnalyzerRuntime(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"analyzers": []analyzerRuntimeRow{{
+			Name:              "job-analyzer",
+			Model:             getenv("LLM_MODEL", "qwen3.5-0.8b-instruct-q4_k_m.gguf"),
+			Endpoint:          getenv("LLM_ENDPOINT", "http://llama-cpp:8080"),
+			Timeout:           getenv("LLM_TIMEOUT", "20s"),
+			MaxTokens:         getenvInt("LLM_MAX_TOKENS", 512),
+			ThinkingEnabled:   getenvBool("LLM_THINKING_ENABLED", false),
+			MaxConcurrency:    getenvInt("LLM_MAX_CONCURRENCY", 1),
+			MaxJobsPerMin:     getenvInt("LLM_MAX_JOBS_PER_MIN", 20),
+			QueuePollInterval: getenv("ANALYZER_QUEUE_POLL_INTERVAL", "1200ms"),
+			LeaseDuration:     getenv("ANALYZER_QUEUE_LEASE_DURATION", "2m"),
+		}},
+	})
+}
+
 func (s *Service) last3HoursRatioPoints() ([]ratioPoint, error) {
 	now := time.Now().UTC().Truncate(time.Minute)
 	start := now.Add(-179 * time.Minute)
@@ -1048,6 +1084,38 @@ func queryCount(db *sql.DB, q string, args ...any) int64 {
 	return n
 }
 
+func getenv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func getenvInt(k string, def int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func getenvBool(k string, def bool) bool {
+	switch strings.TrimSpace(strings.ToLower(os.Getenv(k))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	case "":
+		return def
+	default:
+		return def
+	}
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1085,6 +1153,18 @@ h2 { font-size:14px; }
 .pill.warn { color:#9a3412; border-color:#fdba74; background:#fff7ed; }
 .monitor-grid { display:grid; grid-template-columns:1fr; gap:8px; margin-bottom:10px; }
 .monitor-box { border:1px solid #e2e8f0; border-radius:8px; padding:8px; background:#f8fafc; }
+.monitor-box details { margin:0; }
+.monitor-box summary { list-style:none; cursor:pointer; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.monitor-box summary::-webkit-details-marker { display:none; }
+.monitor-box summary::after { content:'+'; font-weight:700; color:#64748b; }
+.monitor-box details[open] summary::after { content:'-'; }
+.monitor-content { margin-top:8px; }
+.badge-stack { display:flex; gap:6px; flex-wrap:wrap; }
+.analyzer-list { display:grid; grid-template-columns:1fr; gap:8px; }
+.analyzer-card { border:1px solid #dbe2ea; border-radius:8px; padding:8px; background:#fff; }
+.analyzer-head { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; margin-bottom:6px; }
+.analyzer-meta { display:grid; grid-template-columns:1fr 1fr; gap:6px 10px; }
+.analyzer-meta div { font-size:12px; color:#475569; }
 .queue-list { display:grid; grid-template-columns:1fr; gap:6px; margin-top:6px; }
 .queue-row { display:flex; justify-content:space-between; align-items:center; font-size:12px; gap:8px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
@@ -1128,12 +1208,27 @@ button.primary { background:#0f172a; color:#fff; border-color:#0f172a; }
       <input id="newFeedUrl" class="url" placeholder="https://example.com/jobs.rss">
       <button onclick="addFeed()">Aggiungi feed</button>
     </div>
-    <div id="overview" class="row small" style="margin-bottom:10px;"></div>
+    <div class="monitor-box">
+      <details>
+        <summary><span class="small"><strong>Riepilogo pipeline</strong></span></summary>
+        <div id="overview" class="monitor-content badge-stack small"></div>
+      </details>
+    </div>
     <div class="monitor-grid">
       <div class="monitor-box">
-        <div class="small"><strong>Code SQLite (tempo reale)</strong></div>
-        <div id="mosqMeta" class="small" style="margin-top:4px;"></div>
-        <div id="queueList" class="queue-list"></div>
+        <details>
+          <summary><span class="small"><strong>Code SQLite (tempo reale)</strong></span></summary>
+          <div class="monitor-content">
+            <div id="mosqMeta" class="small"></div>
+            <div id="queueList" class="queue-list"></div>
+          </div>
+        </details>
+      </div>
+      <div class="monitor-box">
+        <details>
+          <summary><span class="small"><strong>Analyzer attivi</strong></span></summary>
+          <div id="analyzerList" class="monitor-content analyzer-list small"></div>
+        </details>
       </div>
       <div class="monitor-box">
         <div class="small"><strong>Ratio NEW/DISPATCHED (ultime 3h, 1m)</strong></div>
@@ -1362,6 +1457,32 @@ async function loadOverview() {
     '<span class="pill">ANALYZED: ' + o.analyzed_items + '</span>';
 }
 
+async function loadAnalyzerRuntime() {
+  const data = await api('/api/runtime/analyzers');
+  const list = document.getElementById('analyzerList');
+  const analyzers = data.analyzers || [];
+  list.innerHTML = analyzers.map(a =>
+    '<div class="analyzer-card">' +
+      '<div class="analyzer-head">' +
+        '<div><strong>' + esc(a.name || 'job-analyzer') + '</strong><div class="small mono">' + esc(a.model || '-') + '</div></div>' +
+        '<span class="pill ' + (a.thinking_enabled ? 'ok' : 'warn') + '">thinking: ' + (a.thinking_enabled ? 'on' : 'off') + '</span>' +
+      '</div>' +
+      '<div class="badge-stack" style="margin-bottom:8px;">' +
+        '<span class="pill">max_tokens: ' + (a.max_tokens || 0) + '</span>' +
+        '<span class="pill">timeout: ' + esc(a.timeout || '-') + '</span>' +
+        '<span class="pill">max_jobs/min: ' + (a.max_jobs_per_min || 0) + '</span>' +
+        '<span class="pill">workers: ' + (a.max_concurrency || 0) + '</span>' +
+      '</div>' +
+      '<div class="analyzer-meta">' +
+        '<div><strong>Endpoint</strong><br><span class="mono">' + esc(a.endpoint || '-') + '</span></div>' +
+        '<div><strong>Lease</strong><br><span class="mono">' + esc(a.lease_duration || '-') + '</span></div>' +
+        '<div><strong>Poll interval</strong><br><span class="mono">' + esc(a.queue_poll_interval || '-') + '</span></div>' +
+        '<div><strong>Profile</strong><br><span class="mono">env-configured</span></div>' +
+      '</div>' +
+    '</div>'
+  ).join('');
+}
+
 async function loadFeeds() {
   const feeds = await api('/api/db/feeds');
   const body = document.getElementById('feedsBody');
@@ -1507,6 +1628,7 @@ async function showAnalyzedVersion(encodedId) {
 
 async function reloadAll() {
   await loadOverview();
+  await loadAnalyzerRuntime();
   await loadQueueMonitor();
   await loadFeeds();
   if (currentFeed) {
@@ -1524,6 +1646,10 @@ reloadAll().catch(err => {
 setInterval(() => {
   loadQueueMonitor().catch(err => console.error(err));
 }, 5000);
+
+setInterval(() => {
+  loadAnalyzerRuntime().catch(err => console.error(err));
+}, 30000);
 
 setInterval(() => {
   loadFeeds().catch(err => console.error(err));

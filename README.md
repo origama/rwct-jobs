@@ -37,6 +37,11 @@ Per usare Telegram:
    - `TELEGRAM_CHAT_ID=...`
 2. opzionale: `TELEGRAM_THREAD_ID`, `TELEGRAM_PARSE_MODE`, `TELEGRAM_DISABLE_WEB_PAGE_PREVIEW`
 
+Configurazione analyzer:
+
+- `LLM_THINKING_ENABLED=false` (default): non invia il flag `enable_thinking` alla API del modello.
+- `LLM_THINKING_ENABLED=true`: aggiunge `enable_thinking: true` alla richiesta LLM per backend/modelli che supportano questo toggle.
+
 Profilo prod (llama.cpp):
 
 ```bash

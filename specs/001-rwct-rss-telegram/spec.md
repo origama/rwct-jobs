@@ -95,6 +95,14 @@ Come maintainer RWCT voglio controllare frequenza polling, limiti uso LLM, rate 
 - **FR-028**: Il template Markdown di `message-dispatcher` MUST seguire un layout stile RWCT-JOBS (header brand + source label + link principale + corpo annuncio) e MUST includere se disponibili una sezione link originali e una sezione immagini.
 - **FR-029**: Il web-admin MUST permettere il requeue di un item analizzato reinserendolo in `dispatch_queue`; l'operazione MUST azzerare `dispatched_at`.
 - **FR-030**: Il web-admin MUST permettere il force-poll di un feed tramite richiesta persistita (`feed_poll_requests`) e aggiornare contestualmente la view.
+- **FR-031**: Il progetto MUST centralizzare schema e migrazioni SQLite in un modulo condiviso, eliminando la duplicazione della definizione DB tra servizi.
+- **FR-032**: Il web-admin MUST prevedere un meccanismo minimo di protezione accessi per le operazioni mutative (auth, binding locale o reverse proxy documentato) prima dell'uso fuori ambiente locale.
+- **FR-033**: Il codice SHOULD separare responsabilita` applicative e infrastrutturali, riducendo i file monolitici e spostando UI/assets del web-admin fuori dal sorgente inline.
+- **FR-034**: Il bootstrap/config dei servizi SHOULD essere consolidato in un package condiviso con validazione esplicita delle env vars, evitando `panic` su configurazioni invalide.
+- **FR-035**: Tutti i servizi SHOULD gestire shutdown e telemetria in modo coerente, con health server chiudibile e policy distinte per ambienti dev/prod.
+- **FR-036**: `job-analyzer` MUST esporre in configurazione la modalita` `thinking` del modello e inoltrarla alla richiesta LLM usando il toggle supportato dal backend/modello solo quando esplicitamente abilitata.
+- **FR-037**: Il web-admin SHOULD evitare query N+1 sulle dashboard e usare query aggregate per feed/items/metriche.
+- **FR-038**: Le capability dichiarate in configurazione MUST riflettere il comportamento reale del runtime; parametri non supportati operativamente non devono essere esposti o devono essere implementati.
 
 ### Candidate RSS Seed List (validated 2026-03-04)
 
@@ -128,3 +136,18 @@ Come maintainer RWCT voglio controllare frequenza polling, limiti uso LLM, rate 
 - **SC-005**: `docker compose --profile dev up` porta tutti i servizi in stato healthy senza interventi manuali oltre `.env`.
 - **SC-006**: Suite test minima (unit + queue claim/release/complete + requeue + E2E) eseguibile in CI locale con esito verde.
 - **SC-007**: Per item che contengono hyperlink/immagini nel feed, almeno il 95% dei messaggi finali include correttamente i link e le immagini estratte.
+- **SC-008**: Tutti i servizi avviano lo stesso schema SQLite attraverso un entrypoint unico di migrazione, senza drift tra ambienti o processi.
+- **SC-009**: Il web-admin esposto fuori localhost rifiuta richieste non autorizzate alle operazioni di modifica/cancellazione.
+- **SC-010**: La modalita` `thinking` del modello e` configurabile via env senza rebuild e il flag viene incluso nelle richieste LLM solo quando abilitato.
+
+## Post-MVP Hardening Backlog
+
+- Centralizzare schema, DSN SQLite e migrazioni in un package condiviso (`internal/db` o equivalente).
+- Introdurre protezione per `web-admin` su endpoint mutativi e documentare il deployment sicuro.
+- Rifattorizzare i servizi monolitici in componenti piu` piccoli (`store`, `queue`, `service`, `http`, `ui`).
+- Estrarre HTML/CSS/JS del `web-admin` in asset embedded o file dedicati.
+- Consolidare parsing/validazione env in un package comune.
+- Sostituire i `MustEnv*` con validazione esplicita e errori di startup leggibili.
+- Uniformare startup/shutdown di health server e telemetry.
+- Allineare configurazioni dichiarate e capability reali del runtime, inclusa la concorrenza analyzer.
+- Ottimizzare le query del `web-admin` per evitare pattern N+1 sulle dashboard.

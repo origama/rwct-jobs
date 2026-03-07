@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -61,5 +62,51 @@ func TestBootstrapMarkExisting(t *testing.T) {
 	}
 	if !dup {
 		t.Fatalf("expected item to be marked as processed")
+	}
+}
+
+func TestConfiguredFeedStaysDisabledAfterReload(t *testing.T) {
+	t.Parallel()
+
+	feedURL := "https://example.com/test-feed.rss"
+	db := filepath.Join(t.TempDir(), "rss.db")
+	svc, err := New(Config{
+		DBPath:          db,
+		FeedsCSV:        feedURL,
+		RetryAttempts:   1,
+		RetryBaseDelay:  100 * time.Millisecond,
+		MaxItemsPerPoll: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	feeds, err := svc.loadFeeds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feeds) != 1 || !strings.EqualFold(feeds[0], feedURL) {
+		t.Fatalf("unexpected initial feeds: %#v", feeds)
+	}
+
+	if _, err := svc.db.Exec(`UPDATE rss_feeds SET enabled = 0 WHERE feed_url = ?`, feedURL); err != nil {
+		t.Fatal(err)
+	}
+
+	feeds, err = svc.loadFeeds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feeds) != 0 {
+		t.Fatalf("expected disabled feed not to be loaded, got %#v", feeds)
+	}
+
+	var enabled int
+	if err := svc.db.QueryRow(`SELECT enabled FROM rss_feeds WHERE feed_url = ?`, feedURL).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 0 {
+		t.Fatalf("expected feed to remain disabled, got enabled=%d", enabled)
 	}
 }

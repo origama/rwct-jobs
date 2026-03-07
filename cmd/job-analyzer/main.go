@@ -33,6 +33,21 @@ func getenvInt(k string, def int) int {
 	return n
 }
 
+func getenvBool(k string, def bool) bool {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "true", "TRUE", "yes", "YES", "on", "ON":
+		return true
+	case "0", "false", "FALSE", "no", "NO", "off", "OFF":
+		return false
+	default:
+		return def
+	}
+}
+
 func main() {
 	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
 	slog.SetDefault(slog.New(h))
@@ -45,6 +60,7 @@ func main() {
 		LLMModel:          getenv("LLM_MODEL", "qwen3.5-0.8b-instruct-q4_k_m.gguf"),
 		LLMTimeout:        analyzer.MustEnvDuration("LLM_TIMEOUT", "20s"),
 		LLMMaxTokens:      getenvInt("LLM_MAX_TOKENS", 512),
+		LLMThinking:       getenvBool("LLM_THINKING_ENABLED", false),
 		MaxConcurrency:    getenvInt("LLM_MAX_CONCURRENCY", 1),
 		MaxJobsPerMin:     getenvInt("LLM_MAX_JOBS_PER_MIN", 20),
 		RetryAttempts:     getenvInt("DLQ_RETRY_ATTEMPTS", 3),

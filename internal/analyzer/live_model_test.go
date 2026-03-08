@@ -109,7 +109,7 @@ func TestConfiguredLiveModelRespectsRequestParametersAndReturnsValidJSON(t *test
 	ctx, cancelCall := context.WithTimeout(context.Background(), settings.timeout)
 	defer cancelCall()
 
-	content, err := svc.callLLM(ctx, buildPrompt(in), settings.maxTokens)
+	content, err := svc.callLLM(ctx, buildPrompt(in, ""), settings.maxTokens)
 	if err != nil {
 		t.Fatalf("callLLM failed: %v", err)
 	}

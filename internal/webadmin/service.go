@@ -214,6 +214,21 @@ CREATE TABLE IF NOT EXISTS dispatch_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_queue_state_enqueued ON dispatch_queue(state, enqueued_at);
 CREATE INDEX IF NOT EXISTS idx_dispatch_queue_lease_until ON dispatch_queue(lease_until);
+
+CREATE TABLE IF NOT EXISTS analyzer_runtime (
+ worker_id TEXT PRIMARY KEY,
+ name TEXT NOT NULL,
+ model TEXT NOT NULL,
+ endpoint TEXT NOT NULL,
+ timeout TEXT NOT NULL,
+ max_tokens INTEGER NOT NULL,
+ thinking_enabled INTEGER NOT NULL,
+ max_concurrency INTEGER NOT NULL,
+ max_jobs_per_min INTEGER NOT NULL,
+ queue_poll_interval TEXT NOT NULL,
+ lease_duration TEXT NOT NULL,
+ updated_at DATETIME NOT NULL
+);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return err
@@ -282,6 +297,20 @@ func migrateRSSItemsColumns(db *sql.DB) error {
 )`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_dispatch_queue_state_enqueued ON dispatch_queue(state, enqueued_at)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_dispatch_queue_lease_until ON dispatch_queue(lease_until)`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS analyzer_runtime (
+ worker_id TEXT PRIMARY KEY,
+ name TEXT NOT NULL,
+ model TEXT NOT NULL,
+ endpoint TEXT NOT NULL,
+ timeout TEXT NOT NULL,
+ max_tokens INTEGER NOT NULL,
+ thinking_enabled INTEGER NOT NULL,
+ max_concurrency INTEGER NOT NULL,
+ max_jobs_per_min INTEGER NOT NULL,
+ queue_poll_interval TEXT NOT NULL,
+ lease_duration TEXT NOT NULL,
+ updated_at DATETIME NOT NULL
+)`)
 	return nil
 }
 
@@ -904,9 +933,38 @@ func (s *Service) handleAnalyzerRuntime(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	rows, err := s.db.Query(`
+SELECT name, model, endpoint, timeout, max_tokens, thinking_enabled, max_concurrency, max_jobs_per_min, queue_poll_interval, lease_duration
+FROM analyzer_runtime
+WHERE updated_at >= ?
+ORDER BY updated_at DESC
+`, time.Now().UTC().Add(-20*time.Minute))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"analyzers": []analyzerRuntimeRow{{
+	out := make([]analyzerRuntimeRow, 0)
+	for rows.Next() {
+		var row analyzerRuntimeRow
+		var thinking int
+		if err := rows.Scan(
+			&row.Name, &row.Model, &row.Endpoint, &row.Timeout, &row.MaxTokens, &thinking,
+			&row.MaxConcurrency, &row.MaxJobsPerMin, &row.QueuePollInterval, &row.LeaseDuration,
+		); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		row.ThinkingEnabled = thinking == 1
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(out) == 0 {
+		out = append(out, analyzerRuntimeRow{
 			Name:              "job-analyzer",
 			Model:             getenv("LLM_MODEL", "qwen3.5-0.8b-instruct-q4_k_m.gguf"),
 			Endpoint:          getenv("LLM_ENDPOINT", "http://llama-cpp:8080"),
@@ -917,8 +975,10 @@ func (s *Service) handleAnalyzerRuntime(w http.ResponseWriter, r *http.Request) 
 			MaxJobsPerMin:     getenvInt("LLM_MAX_JOBS_PER_MIN", 20),
 			QueuePollInterval: getenv("ANALYZER_QUEUE_POLL_INTERVAL", "1200ms"),
 			LeaseDuration:     getenv("ANALYZER_QUEUE_LEASE_DURATION", "2m"),
-		}},
-	})
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"analyzers": out})
 }
 
 func (s *Service) last3HoursRatioPoints() ([]ratioPoint, error) {
@@ -1192,6 +1252,16 @@ tr.selected { background:#e2e8f0; }
 button { border:1px solid #94a3b8; background:#fff; border-radius:6px; padding:5px 8px; cursor:pointer; font-size:12px; }
 button.primary { background:#0f172a; color:#fff; border-color:#0f172a; }
 .url { word-break:break-all; }
+.modal-backdrop { position:fixed; inset:0; background:rgba(2,6,23,0.48); display:none; align-items:center; justify-content:center; z-index:40; padding:20px; }
+.modal { width:min(980px, 96vw); max-height:90vh; overflow:auto; border:1px solid #22304a; border-radius:12px; background:#0b1220; color:#e5e7eb; }
+.modal-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px 12px; border-bottom:1px solid #22304a; position:sticky; top:0; background:#0b1220; }
+.modal-title { font-size:13px; font-weight:600; color:#cbd5e1; }
+.code { margin:0; padding:12px; font-size:12px; line-height:1.45; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space:pre-wrap; word-break:break-word; }
+.j-key { color:#7dd3fc; }
+.j-str { color:#a7f3d0; }
+.j-num { color:#fde68a; }
+.j-bool { color:#fca5a5; }
+.j-null { color:#c4b5fd; }
 </style>
 </head>
 <body>
@@ -1281,6 +1351,15 @@ button.primary { background:#0f172a; color:#fff; border-color:#0f172a; }
     </div>
   </section>
 </main>
+<div id="jsonModalBackdrop" class="modal-backdrop" onclick="closeJSONModal(event)">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="jsonModalTitle">
+    <div class="modal-head">
+      <div id="jsonModalTitle" class="modal-title">Processed version JSON</div>
+      <button onclick="closeJSONModal()">Chiudi</button>
+    </div>
+    <pre id="jsonModalBody" class="code"></pre>
+  </div>
+</div>
 
 <script>
 let currentFeed = '';
@@ -1558,11 +1637,13 @@ async function removeFeed(encodedUrl) {
 
 async function selectFeed(url, label, count) {
   currentFeed = url;
-  document.getElementById('selectedFeed').innerHTML =
-    '<div><strong>' + url + '</strong></div><div class="small">source_label: ' + label + ' · db items: ' + count + '</div>';
   await loadFeeds();
 
   const data = await api('/api/db/feed-items?feed_url=' + encodeURIComponent(url) + '&limit=200');
+  const effectiveLabel = data.source_label || label || '-';
+  const effectiveCount = (typeof count === 'number' && count > 0) ? count : ((data.items || []).length || 0);
+  document.getElementById('selectedFeed').innerHTML =
+    '<div><strong>' + url + '</strong></div><div class="small">source_label: ' + effectiveLabel + ' · db items: ' + effectiveCount + '</div>';
   const body = document.getElementById('itemsBody');
   body.innerHTML = '';
   for (const it of (data.items || [])) {
@@ -1623,7 +1704,32 @@ async function showAnalyzedVersion(encodedId) {
     alert('Nessuna processed version disponibile per questo item.');
     return;
   }
-  alert(res.analyzed_payload_json);
+  showJSONModal(id, res.analyzed_payload_json);
+}
+
+function syntaxHighlightJSON(v) {
+  const escText = esc(v);
+  return escText
+    .replace(/\"([^\"\\]|\\.)*\"(?=\\s*:)/g, '<span class="j-key">$&</span>')
+    .replace(/(:\\s*)\"([^\"\\]|\\.)*\"/g, '$1<span class="j-str">"$2"</span>')
+    .replace(/\\b(true|false)\\b/g, '<span class="j-bool">$1</span>')
+    .replace(/\\bnull\\b/g, '<span class="j-null">null</span>')
+    .replace(/-?\\b\\d+(?:\\.\\d+)?(?:[eE][+\\-]?\\d+)?\\b/g, '<span class="j-num">$&</span>');
+}
+
+function showJSONModal(id, rawPayload) {
+  let formatted = rawPayload;
+  try {
+    formatted = JSON.stringify(JSON.parse(rawPayload), null, 2);
+  } catch (_) {}
+  document.getElementById('jsonModalTitle').textContent = 'Processed version JSON · ' + id;
+  document.getElementById('jsonModalBody').innerHTML = syntaxHighlightJSON(formatted);
+  document.getElementById('jsonModalBackdrop').style.display = 'flex';
+}
+
+function closeJSONModal(ev) {
+  if (ev && ev.target && ev.target.id !== 'jsonModalBackdrop') return;
+  document.getElementById('jsonModalBackdrop').style.display = 'none';
 }
 
 async function reloadAll() {

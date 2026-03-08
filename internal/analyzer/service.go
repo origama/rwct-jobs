@@ -7,9 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -49,19 +53,27 @@ var normalizedJobCategories = map[string]string{
 }
 
 type Config struct {
-	DBPath            string
-	QueuePollInterval time.Duration
-	LeaseDuration     time.Duration
-	LLMEndpoint       string
-	LLMModel          string
-	LLMTimeout        time.Duration
-	LLMMaxTokens      int
-	LLMThinking       bool
-	MaxConcurrency    int
-	MaxJobsPerMin     int
-	RetryAttempts     int
-	RetryBaseDelay    time.Duration
+	DBPath              string
+	QueuePollInterval   time.Duration
+	LeaseDuration       time.Duration
+	LLMEndpoint         string
+	LLMModel            string
+	LLMTimeout          time.Duration
+	LLMMaxTokens        int
+	LLMThinking         bool
+	ScrapeSourcePage    bool
+	MaxConcurrency      int
+	MaxJobsPerMin       int
+	MaxDeliveryAttempts int
+	RetryAttempts       int
+	RetryBaseDelay      time.Duration
 }
+
+var (
+	reScriptTags = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
+	reStyleTags  = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
+	reHTMLTags   = regexp.MustCompile(`(?s)<[^>]+>`)
+)
 
 type Service struct {
 	cfg      Config
@@ -84,6 +96,9 @@ func New(cfg Config) (*Service, error) {
 	}
 	if cfg.MaxJobsPerMin < 1 {
 		cfg.MaxJobsPerMin = 10
+	}
+	if cfg.MaxDeliveryAttempts < 1 {
+		cfg.MaxDeliveryAttempts = 3
 	}
 	if cfg.QueuePollInterval <= 0 {
 		cfg.QueuePollInterval = 1200 * time.Millisecond
@@ -167,6 +182,21 @@ CREATE TABLE IF NOT EXISTS dispatch_queue (
  done_at DATETIME,
  last_error TEXT,
  updated_at DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS analyzer_runtime (
+ worker_id TEXT PRIMARY KEY,
+ name TEXT NOT NULL,
+ model TEXT NOT NULL,
+ endpoint TEXT NOT NULL,
+ timeout TEXT NOT NULL,
+ max_tokens INTEGER NOT NULL,
+ thinking_enabled INTEGER NOT NULL,
+ max_concurrency INTEGER NOT NULL,
+ max_jobs_per_min INTEGER NOT NULL,
+ queue_poll_interval TEXT NOT NULL,
+ lease_duration TEXT NOT NULL,
+ updated_at DATETIME NOT NULL
 );`
 	if _, err := db.Exec(schema); err != nil {
 		return err
@@ -239,6 +269,7 @@ func migrateRSSItemsColumns(db *sql.DB) error {
 func (s *Service) Run(ctx context.Context) error {
 	slog.Info("job-analyzer started", "queue", "analyzer_queue", "worker_id", s.workerID, "model", s.cfg.LLMModel)
 	defer s.db.Close()
+	s.upsertRuntimeSnapshot()
 
 	for {
 		select {
@@ -307,6 +338,13 @@ func (s *Service) handleClaimedMessage(ctx context.Context, itemID string, paylo
 	})
 	if err != nil {
 		slog.Error("analysis failed after retries", "item_id", in.ID, "err", err)
+		if s.shouldQuarantineClaim(itemID, err) {
+			reason := fmt.Sprintf("poison_item: analysis_failed: %v", err)
+			_ = s.markItemStatus(in.ID, events.ItemStatusFailed, reason, nil)
+			_ = s.failClaim(itemID, reason)
+			slog.Warn("claim quarantined after repeated/non-retryable failures", "item_id", in.ID, "worker_id", s.workerID)
+			return err
+		}
 		_ = s.releaseClaim(itemID, fmt.Sprintf("analysis_failed: %v", err))
 		return err
 	}
@@ -399,6 +437,19 @@ WHERE item_id = ? AND lease_owner = ?`, strings.TrimSpace(reason), now, strings.
 	return err
 }
 
+func (s *Service) failClaim(itemID, reason string) error {
+	now := time.Now().UTC()
+	_, err := s.db.Exec(`UPDATE analyzer_queue
+SET state='DONE',
+    lease_owner=NULL,
+    lease_until=NULL,
+    done_at=COALESCE(done_at, ?),
+    last_error=?,
+    updated_at=?
+WHERE item_id = ? AND lease_owner = ?`, now, strings.TrimSpace(reason), now, strings.TrimSpace(itemID), s.workerID)
+	return err
+}
+
 func (s *Service) loadStoredAnalyzed(itemID string) (bool, string, error) {
 	var payload string
 	err := s.db.QueryRow(`SELECT COALESCE(analyzed_payload_json,'') FROM rss_items WHERE id = ?`, strings.TrimSpace(itemID)).Scan(&payload)
@@ -462,7 +513,16 @@ func (s *Service) publishError(itemID string, attempt int, code string, err erro
 }
 
 func (s *Service) analyze(ctx context.Context, in events.RawJobItem) (events.AnalyzedJob, error) {
-	content, err := s.callLLM(ctx, buildPrompt(in), s.cfg.LLMMaxTokens)
+	sourcePageText := ""
+	if s.cfg.ScrapeSourcePage {
+		if body, err := s.fetchSourcePageExcerpt(ctx, in.URL); err == nil {
+			sourcePageText = body
+		} else if strings.TrimSpace(in.URL) != "" {
+			slog.Warn("source page scraping failed; continuing with feed payload only", "item_id", in.ID, "url", in.URL, "err", err)
+		}
+	}
+
+	content, err := s.callLLM(ctx, buildPrompt(in, sourcePageText), s.cfg.LLMMaxTokens)
 	if err != nil {
 		return events.AnalyzedJob{}, err
 	}
@@ -481,7 +541,7 @@ func (s *Service) analyze(ctx context.Context, in events.RawJobItem) (events.Ana
 			fallbackTokens = 1024
 		}
 		slog.Warn("llm returned truncated json, retrying compact mode", "item_id", in.ID, "max_tokens", fallbackTokens)
-		content2, err2 := s.callLLM(ctx, buildCompactPrompt(in), fallbackTokens)
+		content2, err2 := s.callLLM(ctx, buildCompactPrompt(in, sourcePageText), fallbackTokens)
 		if err2 != nil {
 			return events.AnalyzedJob{}, err2
 		}
@@ -494,15 +554,22 @@ func (s *Service) analyze(ctx context.Context, in events.RawJobItem) (events.Ana
 	return events.AnalyzedJob{}, parseErr
 }
 
-func buildPrompt(in events.RawJobItem) string {
+func buildPrompt(in events.RawJobItem, sourcePageText string) string {
 	description := strings.TrimSpace(in.Description)
 	if len(description) > 1800 {
 		description = description[:1800]
 	}
+	sourcePageText = clampString(strings.TrimSpace(sourcePageText), 2500)
+	if sourcePageText == "" {
+		sourcePageText = "N/D"
+	}
 	return fmt.Sprintf(`Analizza il seguente annuncio lavoro e restituisci SOLO JSON valido con i campi:
 job_category, role, company, seniority, location, remote_type, tech_stack (array), contract_type, salary, language, summary_it, confidence.
 Lingua output: italiano.
-Se un campo non è presente usa stringa vuota (o array vuoto).
+Regola anti-allucinazioni (obbligatoria): usa solo informazioni esplicitamente presenti in titolo/descrizione/link forniti.
+NON inferire da conoscenza esterna e NON inventare valori mancanti.
+Se un campo non è chiaramente presente usa stringa vuota (o array vuoto).
+Campi da valorizzare con massima priorita' (se presenti): seniority, location, contract_type, salary, tech_stack.
 Mantieni tech_stack breve: massimo 8 tecnologie reali, senza inventare valori.
 summary_it: una sola frase, massimo 220 caratteri.
 Per job_category usa SOLO una di queste categorie esatte:
@@ -512,25 +579,33 @@ Se non è classificabile, usa esattamente: Altri ruoli.
 Titolo: %s
 URL: %s
 Descrizione: %s
+Contenuto pagina sorgente (estratto): %s
 Link estratti: %s
-Immagini estratte: %s`, strings.Join(allowedJobCategories, ", "), in.Title, in.URL, description, strings.Join(in.Links, ", "), strings.Join(in.ImageURLs, ", "))
+Immagini estratte: %s`, strings.Join(allowedJobCategories, ", "), in.Title, in.URL, description, sourcePageText, strings.Join(in.Links, ", "), strings.Join(in.ImageURLs, ", "))
 }
 
-func buildCompactPrompt(in events.RawJobItem) string {
+func buildCompactPrompt(in events.RawJobItem, sourcePageText string) string {
 	description := strings.TrimSpace(in.Description)
 	if len(description) > 1200 {
 		description = description[:1200]
+	}
+	sourcePageText = clampString(strings.TrimSpace(sourcePageText), 1600)
+	if sourcePageText == "" {
+		sourcePageText = "N/D"
 	}
 	return fmt.Sprintf(`Restituisci SOLO 1 riga JSON valida (nessun markdown, nessun testo extra) con questi campi:
 job_category,role,company,seniority,location,remote_type,tech_stack,contract_type,salary,language,summary_it,confidence
 Vincoli:
 - job_category deve essere una di: %s
+- usa SOLO informazioni esplicitamente presenti nel testo fornito
+- non inventare: se non chiaro/menzionato usa stringa vuota o array vuoto
 - tech_stack massimo 8 elementi
 - summary_it massimo 220 caratteri
 
 Titolo: %s
 URL: %s
-Descrizione: %s`, strings.Join(allowedJobCategories, ", "), in.Title, in.URL, description)
+Descrizione: %s
+Contenuto pagina sorgente (estratto): %s`, strings.Join(allowedJobCategories, ", "), in.Title, in.URL, description, sourcePageText)
 }
 
 func stripMarkdownCodeFence(v string) string {
@@ -604,7 +679,13 @@ func parseAnalyzedJob(content string, in events.RawJobItem) (events.AnalyzedJob,
 	out.OriginalLinks = uniqueURLs([]string{in.URL}, in.Links)
 	out.OriginalImages = uniqueURLs(in.ImageURLs)
 	out.JobCategory = normalizeJobCategory(out.JobCategory)
+	out.Seniority = sanitizeUnknown(out.Seniority)
+	out.Location = sanitizeUnknown(out.Location)
+	out.ContractType = sanitizeUnknown(out.ContractType)
+	out.Salary = sanitizeUnknown(out.Salary)
 	out.TechStack = trimList(out.TechStack, 8)
+	out.TechStack = sanitizeTechStack(out.TechStack)
+	out.JobPostQualityScore, out.JobPostQualityRank, out.JobPostMissing = computeJobPostQuality(out)
 	if out.Language == "" {
 		out.Language = "it"
 	}
@@ -668,4 +749,225 @@ func normalizeJobCategory(v string) string {
 		}
 	}
 	return "Altri ruoli"
+}
+
+func (s *Service) fetchSourcePageExcerpt(ctx context.Context, rawURL string) (string, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "", nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u == nil {
+		return "", fmt.Errorf("invalid source url")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("unsupported source url scheme: %s", u.Scheme)
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "rwct-agent-analyzer/1.0 (+source-page-scraper)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("source page status: %d", resp.StatusCode)
+	}
+
+	limited := io.LimitReader(resp.Body, 256*1024)
+	b, err := io.ReadAll(limited)
+	if err != nil {
+		return "", err
+	}
+	txt := extractTextFromHTML(string(b))
+	txt = clampString(txt, 2500)
+	return txt, nil
+}
+
+func extractTextFromHTML(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	clean := reScriptTags.ReplaceAllString(raw, " ")
+	clean = reStyleTags.ReplaceAllString(clean, " ")
+	clean = reHTMLTags.ReplaceAllString(clean, " ")
+	clean = html.UnescapeString(clean)
+	clean = strings.Join(strings.Fields(clean), " ")
+	return strings.TrimSpace(clean)
+}
+
+func clampString(v string, max int) string {
+	v = strings.TrimSpace(v)
+	if max <= 0 || len(v) <= max {
+		return v
+	}
+	return strings.TrimSpace(v[:max])
+}
+
+func (s *Service) shouldQuarantineClaim(itemID string, err error) bool {
+	if isNonRetryableAnalysisErr(err) {
+		return true
+	}
+	deliveryCount, loadErr := s.currentClaimDeliveryCount(itemID)
+	if loadErr != nil {
+		slog.Warn("cannot read claim delivery_count; fallback to requeue", "item_id", itemID, "err", loadErr)
+		return false
+	}
+	return deliveryCount >= s.cfg.MaxDeliveryAttempts
+}
+
+func (s *Service) currentClaimDeliveryCount(itemID string) (int, error) {
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COALESCE(delivery_count, 0)
+FROM analyzer_queue
+WHERE item_id = ? AND lease_owner = ?`,
+		strings.TrimSpace(itemID), s.workerID,
+	).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func isNonRetryableAnalysisErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(s, "missing required analyzed fields")
+}
+
+func (s *Service) upsertRuntimeSnapshot() {
+	now := time.Now().UTC()
+	thinking := 0
+	if s.cfg.LLMThinking {
+		thinking = 1
+	}
+	_, err := s.db.Exec(`INSERT INTO analyzer_runtime(
+worker_id, name, model, endpoint, timeout, max_tokens, thinking_enabled, max_concurrency, max_jobs_per_min, queue_poll_interval, lease_duration, updated_at
+) VALUES(?, 'job-analyzer', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(worker_id) DO UPDATE SET
+ name=excluded.name,
+ model=excluded.model,
+ endpoint=excluded.endpoint,
+ timeout=excluded.timeout,
+ max_tokens=excluded.max_tokens,
+ thinking_enabled=excluded.thinking_enabled,
+ max_concurrency=excluded.max_concurrency,
+ max_jobs_per_min=excluded.max_jobs_per_min,
+ queue_poll_interval=excluded.queue_poll_interval,
+ lease_duration=excluded.lease_duration,
+ updated_at=excluded.updated_at`,
+		s.workerID,
+		strings.TrimSpace(s.cfg.LLMModel),
+		strings.TrimSpace(s.cfg.LLMEndpoint),
+		s.cfg.LLMTimeout.String(),
+		s.cfg.LLMMaxTokens,
+		thinking,
+		s.cfg.MaxConcurrency,
+		s.cfg.MaxJobsPerMin,
+		s.cfg.QueuePollInterval.String(),
+		s.cfg.LeaseDuration.String(),
+		now,
+	)
+	if err != nil {
+		slog.Warn("upsert analyzer runtime snapshot failed", "worker_id", s.workerID, "err", err)
+	}
+}
+
+func sanitizeUnknown(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	lv := strings.ToLower(v)
+	placeholders := []string{
+		"unknown", "n/a", "na", "none", "null", "-", "--",
+		"not specified", "not available", "unspecified", "tbd",
+		"non specificato", "non disponibile", "non indicato", "da definire", "nessuno",
+	}
+	for _, p := range placeholders {
+		if lv == p {
+			return ""
+		}
+	}
+	return v
+}
+
+func sanitizeTechStack(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, v := range values {
+		clean := sanitizeUnknown(v)
+		if clean == "" {
+			continue
+		}
+		key := strings.ToLower(clean)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, clean)
+	}
+	return out
+}
+
+func computeJobPostQuality(out events.AnalyzedJob) (score int, rank string, missing []string) {
+	type fieldCheck struct {
+		name string
+		ok   bool
+	}
+	checks := []fieldCheck{
+		{name: "seniority", ok: sanitizeUnknown(out.Seniority) != ""},
+		{name: "location", ok: sanitizeUnknown(out.Location) != ""},
+		{name: "contract_type", ok: sanitizeUnknown(out.ContractType) != ""},
+		{name: "salary", ok: hasClearSalary(out.Salary)},
+		{name: "tech_stack", ok: len(sanitizeTechStack(out.TechStack)) > 0},
+	}
+	for _, c := range checks {
+		if c.ok {
+			score += 20
+			continue
+		}
+		missing = append(missing, c.name)
+	}
+	switch {
+	case score >= 90:
+		rank = "A"
+	case score >= 70:
+		rank = "B"
+	case score >= 50:
+		rank = "C"
+	default:
+		rank = "D"
+	}
+	return score, rank, missing
+}
+
+func hasClearSalary(v string) bool {
+	v = sanitizeUnknown(v)
+	if v == "" {
+		return false
+	}
+	lv := strings.ToLower(v)
+	ambiguous := []string{
+		"competitive", "commisurata", "negoziabile", "market rate", "depends", "depending",
+		"to be defined", "da definire", "tbd",
+	}
+	for _, token := range ambiguous {
+		if strings.Contains(lv, token) {
+			return false
+		}
+	}
+	return strings.ContainsAny(v, "0123456789€$£")
 }

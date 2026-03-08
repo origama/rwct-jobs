@@ -53,18 +53,20 @@ func main() {
 	slog.SetDefault(slog.New(h))
 
 	cfg := analyzer.Config{
-		DBPath:            getenv("ITEM_DB_PATH", getenv("RSS_DB_PATH", "/data/rss-reader.db")),
-		QueuePollInterval: analyzer.MustEnvDuration("ANALYZER_QUEUE_POLL_INTERVAL", "1200ms"),
-		LeaseDuration:     analyzer.MustEnvDuration("ANALYZER_QUEUE_LEASE_DURATION", "2m"),
-		LLMEndpoint:       getenv("LLM_ENDPOINT", "http://llama-cpp:8080"),
-		LLMModel:          getenv("LLM_MODEL", "qwen3.5-0.8b-instruct-q4_k_m.gguf"),
-		LLMTimeout:        analyzer.MustEnvDuration("LLM_TIMEOUT", "20s"),
-		LLMMaxTokens:      getenvInt("LLM_MAX_TOKENS", 512),
-		LLMThinking:       getenvBool("LLM_THINKING_ENABLED", false),
-		MaxConcurrency:    getenvInt("LLM_MAX_CONCURRENCY", 1),
-		MaxJobsPerMin:     getenvInt("LLM_MAX_JOBS_PER_MIN", 20),
-		RetryAttempts:     getenvInt("DLQ_RETRY_ATTEMPTS", 3),
-		RetryBaseDelay:    analyzer.MustEnvDuration("DLQ_RETRY_BASE_DELAY", "2s"),
+		DBPath:              getenv("ITEM_DB_PATH", getenv("RSS_DB_PATH", "/data/rss-reader.db")),
+		QueuePollInterval:   analyzer.MustEnvDuration("ANALYZER_QUEUE_POLL_INTERVAL", "1200ms"),
+		LeaseDuration:       analyzer.MustEnvDuration("ANALYZER_QUEUE_LEASE_DURATION", "2m"),
+		LLMEndpoint:         getenv("LLM_ENDPOINT", "http://llama-cpp:8080"),
+		LLMModel:            getenv("LLM_MODEL", "qwen3.5-0.8b-instruct-q4_k_m.gguf"),
+		LLMTimeout:          analyzer.MustEnvDuration("LLM_TIMEOUT", "20s"),
+		LLMMaxTokens:        getenvInt("LLM_MAX_TOKENS", 512),
+		LLMThinking:         getenvBool("LLM_THINKING_ENABLED", false),
+		ScrapeSourcePage:    getenvBool("ANALYZER_SCRAPE_SOURCE_PAGE", true),
+		MaxConcurrency:      getenvInt("LLM_MAX_CONCURRENCY", 1),
+		MaxJobsPerMin:       getenvInt("LLM_MAX_JOBS_PER_MIN", 20),
+		MaxDeliveryAttempts: getenvInt("ANALYZER_MAX_DELIVERY_ATTEMPTS", 3),
+		RetryAttempts:       getenvInt("DLQ_RETRY_ATTEMPTS", 3),
+		RetryBaseDelay:      analyzer.MustEnvDuration("DLQ_RETRY_BASE_DELAY", "2s"),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

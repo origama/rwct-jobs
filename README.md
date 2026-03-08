@@ -1,64 +1,71 @@
-# RWCT Agent Services (MVP Scaffold)
+# RWCT Agent Services
 
-Microservizi Go per pipeline RSS -> SQLite Queue -> LLM Analyzer -> Dispatcher.
+Pipeline a microservizi Go: `RSS -> SQLite queue -> LLM analyzer -> dispatcher`.
 
 ## Servizi
 
-- `rss-reader`: legge feed RSS, deduplica (guid/url/titolo), inserisce item nuovi in `analyzer_queue` (SQLite).
-- `job-analyzer`: consuma `analyzer_queue` con lease/ack, usa LLM locale (o mock), produce job strutturati e li mette in `dispatch_queue`.
-- `message-dispatcher`: consuma `dispatch_queue` con lease/ack, renderizza template markdown, invia al sink configurato.
-- `web-admin`: UI web per gestire feed RSS (add/remove + preview) e dashboard statistiche (categorie, seniority, recenti).
+- `rss-reader`: poll feed RSS, deduplica item e pubblica payload raw in `analyzer_queue`.
+- `job-analyzer`: consuma `analyzer_queue`, analizza con LLM locale (llama.cpp), salva payload analizzato e accoda su `dispatch_queue`.
+- `message-dispatcher`: consuma `dispatch_queue`, renderizza template markdown e invia a file o Telegram.
+- `web-admin`: UI per feed management, monitor code, runtime analyzer, requeue item e ispezione payload analizzati.
 
-Semantica coda/processed:
-- un item nuovo entra in `analyzer_queue` (`state=QUEUED`)
-- `job-analyzer` fa claim (`LEASED`), processa e poi `DONE`, inserendo l'output in `dispatch_queue`
-- `message-dispatcher` fa claim da `dispatch_queue`, invia e marca item `DISPATCHED`
-- su errore la claim viene rilasciata in `QUEUED` con `last_error` (retry controllato)
+## Stato e queue
+
+- Queue raw: `analyzer_queue` (`QUEUED -> LEASED -> DONE`).
+- Queue analyzed: `dispatch_queue` (`QUEUED -> LEASED -> DONE`).
+- Stato business item: `rss_items.status` (`NEW`, `ANALYZED`, `DISPATCHED`, `FAILED`).
+- Le code sono implementate via SQLite condiviso, senza broker esterno.
+
+Per i diagrammi completi delle state machine/lifecycle:
+- [Lifecycle e State Machine](docs/lifecycle-state-machines.md)
 
 ## Avvio rapido
-
-1. Copia `.env.example` in `.env`
-2. Profilo dev:
 
 ```bash
 cp .env.example .env
 docker compose --profile dev up --build
 ```
 
-Output test messages:
+Output file sink di default:
+- `/data/outbox/messages.md` nel volume `rwct-data`.
 
-- `/data/outbox/messages.md` nel volume `rwct-data`
-
-Per usare Telegram:
-
-1. imposta in `.env`:
-   - `DESTINATION_MODE=telegram`
-   - `TELEGRAM_BOT_TOKEN=...`
-   - `TELEGRAM_CHAT_ID=...`
-2. opzionale: `TELEGRAM_THREAD_ID`, `TELEGRAM_PARSE_MODE`, `TELEGRAM_DISABLE_WEB_PAGE_PREVIEW`
-
-Configurazione analyzer:
-
-- `LLM_THINKING_ENABLED=false` (default): non invia il flag `enable_thinking` alla API del modello.
-- `LLM_THINKING_ENABLED=true`: aggiunge `enable_thinking: true` alla richiesta LLM per backend/modelli che supportano questo toggle.
-
-Profilo prod (llama.cpp):
+Profilo produzione (llama.cpp):
 
 ```bash
 docker compose --profile prod up --build
 ```
 
-Nota bootstrap feed-reader:
-- `RSS_BOOTSTRAP_MARK_EXISTING=false` (default): su DB vuoto gli item non sono pre-marcati.
-- `RSS_COLD_START_ITEMS_PER_FEED` (default `3`): limita quanti item per feed vengono pubblicati in cold start.
+## Configurazione analyzer (chiavi principali)
+
+- `LLM_MODEL`, `LLM_ENDPOINT`, `LLM_TIMEOUT`, `LLM_MAX_TOKENS`
+- `LLM_THINKING_ENABLED=true|false`: inoltra `enable_thinking` alla `/v1/chat/completions` quando supportato.
+- `ANALYZER_SCRAPE_SOURCE_PAGE=true|false` (default `true`): fa fetch della pagina linkata nel job e aggiunge il testo estratto al prompt.
+- `ANALYZER_MAX_DELIVERY_ATTEMPTS` (default `3`): soglia anti-poison item su `analyzer_queue`.
+
+## Telegram
+
+Per usare Telegram impostare:
+- `DESTINATION_MODE=telegram`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+Opzionali:
+- `TELEGRAM_THREAD_ID`
+- `TELEGRAM_PARSE_MODE`
+- `TELEGRAM_DISABLE_WEB_PAGE_PREVIEW`
 
 ## Web Admin
 
-- URL: `http://localhost:8090` (configurabile con `WEB_ADMIN_PORT`)
-- Funzioni:
-  - aggiunta/rimozione feed RSS persistente su SQLite
-  - preview di un feed (titolo + ultimi item)
-  - statistiche items ricevuti/analizzati (per categoria e seniority)
+- URL: `http://localhost:8090` (`WEB_ADMIN_PORT` per override)
+- Funzioni principali:
+- gestione feed (`add/remove/enable/disable/force poll`)
+- monitor queue e pipeline (`raw/analyzed backlog/inflight`, stuck detectors)
+- pannello analyzer runtime (modello attivo, thinking, timeout, max tokens, rate)
+- requeue di item analizzati e visualizzazione JSON processato
+
+## Troubleshooting
+
+- [Troubleshooting operativo](docs/troubleshooting.md)
 
 ## Test
 

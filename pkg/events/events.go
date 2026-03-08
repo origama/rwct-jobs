@@ -27,27 +27,30 @@ type RawJobItem struct {
 }
 
 type AnalyzedJob struct {
-	SchemaVersion  string    `json:"schema_version"`
-	ID             string    `json:"id"`
-	GUID           string    `json:"guid,omitempty"`
-	SourceURL      string    `json:"source_url"`
-	SourceLabel    string    `json:"source_label,omitempty"`
-	Title          string    `json:"title"`
-	JobCategory    string    `json:"job_category"`
-	Role           string    `json:"role"`
-	Company        string    `json:"company"`
-	Seniority      string    `json:"seniority"`
-	Location       string    `json:"location"`
-	RemoteType     string    `json:"remote_type"`
-	TechStack      []string  `json:"tech_stack"`
-	ContractType   string    `json:"contract_type"`
-	Salary         string    `json:"salary"`
-	Language       string    `json:"language"`
-	SummaryIT      string    `json:"summary_it"`
-	OriginalLinks  []string  `json:"original_links,omitempty"`
-	OriginalImages []string  `json:"original_images,omitempty"`
-	Confidence     float64   `json:"confidence"`
-	CreatedAt      time.Time `json:"created_at"`
+	SchemaVersion       string    `json:"schema_version"`
+	ID                  string    `json:"id"`
+	GUID                string    `json:"guid,omitempty"`
+	SourceURL           string    `json:"source_url"`
+	SourceLabel         string    `json:"source_label,omitempty"`
+	Title               string    `json:"title"`
+	JobCategory         string    `json:"job_category"`
+	Role                string    `json:"role"`
+	Company             string    `json:"company"`
+	Seniority           string    `json:"seniority"`
+	Location            string    `json:"location"`
+	RemoteType          string    `json:"remote_type"`
+	TechStack           []string  `json:"tech_stack"`
+	ContractType        string    `json:"contract_type"`
+	Salary              string    `json:"salary"`
+	JobPostQualityScore int       `json:"job_post_quality_score"`
+	JobPostQualityRank  string    `json:"job_post_quality_rank"`
+	JobPostMissing      []string  `json:"job_post_missing_fields,omitempty"`
+	Language            string    `json:"language"`
+	SummaryIT           string    `json:"summary_it"`
+	OriginalLinks       []string  `json:"original_links,omitempty"`
+	OriginalImages      []string  `json:"original_images,omitempty"`
+	Confidence          float64   `json:"confidence"`
+	CreatedAt           time.Time `json:"created_at"`
 }
 
 type ProcessingError struct {

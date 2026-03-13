@@ -74,7 +74,7 @@ require_cmd() {
 
 run_compose() {
   local -a args
-  local -a up_args
+  local -a up_scale_args
   IFS=' ' read -r -a compose_cmd <<<"${COMPOSE_BIN}"
 
   if [[ -n "${COMPOSE_FILES}" ]]; then
@@ -95,16 +95,16 @@ run_compose() {
     args+=("--project-name" "${COMPOSE_PROJECT_NAME}")
   fi
 
-  up_args=("${args[@]}")
+  up_scale_args=()
   if [[ -n "${COMPOSE_SCALE}" ]]; then
     IFS=',' read -r -a scales <<<"${COMPOSE_SCALE}"
     for s in "${scales[@]}"; do
-      [[ -n "${s}" ]] && up_args+=("--scale" "${s}")
+      [[ -n "${s}" ]] && up_scale_args+=("--scale" "${s}")
     done
   fi
 
   "${compose_cmd[@]}" "${args[@]}" pull
-  "${compose_cmd[@]}" "${up_args[@]}" up -d --remove-orphans
+  "${compose_cmd[@]}" "${args[@]}" up "${up_scale_args[@]}" -d --remove-orphans
 }
 
 resolve_compose_bin() {

@@ -29,6 +29,7 @@ type Config struct {
 	DestinationMode        string
 	FileSinkPath           string
 	TemplatePath           string
+	TelegramTemplatePath   string
 	RateLimitPerMin        int
 	RetryAttempts          int
 	RetryBaseDelay         time.Duration
@@ -45,6 +46,7 @@ type Service struct {
 	db       *sql.DB
 	limiter  *rate.Limiter
 	tpl      *template.Template
+	tplTG    *template.Template
 	http     *http.Client
 	workerID string
 }
@@ -111,11 +113,28 @@ func New(cfg Config) (*Service, error) {
 		_ = db.Close()
 		return nil, err
 	}
+
+	tplTG := tpl
+	if strings.TrimSpace(cfg.TelegramTemplatePath) != "" {
+		b, err := os.ReadFile(cfg.TelegramTemplatePath)
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("read telegram template failed: %w", err)
+		}
+		tplTG, err = template.New("dispatch-telegram").Funcs(template.FuncMap{
+			"md": escapeMarkdownText,
+		}).Parse(string(b))
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("parse telegram template failed: %w", err)
+		}
+	}
 	return &Service{
 		cfg:      cfg,
 		db:       db,
 		limiter:  rate.NewLimiter(rate.Every(time.Minute/time.Duration(cfg.RateLimitPerMin)), 1),
 		tpl:      tpl,
+		tplTG:    tplTG,
 		http:     &http.Client{Timeout: 20 * time.Second},
 		workerID: fmt.Sprintf("dispatcher-%d", time.Now().UTC().UnixNano()),
 	}, nil
@@ -268,8 +287,12 @@ func (s *Service) handleClaimedMessage(ctx context.Context, itemID string, paylo
 		slog.Info("skip duplicate analyzed item already dispatched", "item_id", in.ID)
 		return s.completeDispatchClaim(itemID)
 	}
+	tpl := s.tpl
+	if strings.EqualFold(strings.TrimSpace(s.cfg.DestinationMode), "telegram") {
+		tpl = s.tplTG
+	}
 	var msg bytes.Buffer
-	if err := s.tpl.Execute(&msg, in); err != nil {
+	if err := tpl.Execute(&msg, in); err != nil {
 		_ = s.releaseDispatchClaim(itemID, fmt.Sprintf("template_execute_failed: %v", err))
 		return err
 	}

@@ -44,6 +44,7 @@ func main() {
 		DestinationMode:        getenv("DESTINATION_MODE", "file"),
 		FileSinkPath:           getenv("FILE_SINK_PATH", "/data/outbox/messages.md"),
 		TemplatePath:           getenv("DISPATCH_TEMPLATE_FILE", "/app/configs/message.tmpl.md"),
+		TelegramTemplatePath:   getenv("TELEGRAM_TEMPLATE_FILE", ""),
 		RateLimitPerMin:        getenvInt("DISPATCH_RATE_LIMIT_PER_MIN", 30),
 		RetryAttempts:          getenvInt("DLQ_RETRY_ATTEMPTS", 3),
 		RetryBaseDelay:         dispatcher.MustEnvDuration("DLQ_RETRY_BASE_DELAY", "2s"),

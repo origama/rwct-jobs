@@ -49,11 +49,16 @@ Per usare Telegram impostare:
 - `DESTINATION_MODE=telegram`
 - `TELEGRAM_BOT_TOKEN` (in `.env.secrets`)
 - `TELEGRAM_CHAT_ID` (in `.env.secrets`)
+- `TELEGRAM_TEMPLATE_FILE` (es. `/app/configs/message.telegram.tmpl.md`)
 
 Opzionali:
 - `TELEGRAM_THREAD_ID`
 - `TELEGRAM_PARSE_MODE`
 - `TELEGRAM_DISABLE_WEB_PAGE_PREVIEW`
+
+Template:
+- `DISPATCH_TEMPLATE_FILE`: template Go `text/template` usato per destinazioni non-Telegram.
+- `TELEGRAM_TEMPLATE_FILE`: template Go `text/template` dedicato a Telegram (fallback su `DISPATCH_TEMPLATE_FILE` se non impostato).
 
 ## Web Admin
 

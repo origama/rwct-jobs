@@ -1,5 +1,5 @@
-💼 *{{md .Title}}*
-🏢 *{{md .Company}}* · {{md .ContractType}}
+💼 *{{md .Title}}* @ *{{md .Company}}*
+🏢 {{md .ContractType}}
 🌍 {{md .Location}} · {{md .RemoteType}}
 💰 {{md .Salary}}
 

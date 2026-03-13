@@ -42,7 +42,8 @@
 # Useful environment variables:
 #   REPO_DIR, REMOTE, BRANCH, LOCK_FILE, ALWAYS_RECONCILE,
 #   COMPOSE_FILES, COMPOSE_PROFILES, COMPOSE_PROJECT_NAME, COMPOSE_BIN,
-#   COMPOSE_SCALE (e.g. "job-analyzer=2,message-dispatcher=1")
+#   COMPOSE_SCALE (e.g. "job-analyzer=2,message-dispatcher=1"),
+#   COMPOSE_BUILD (auto|always|never)
 set -Eeuo pipefail
 
 # GitOps pull + Docker Compose reconciliation for a single Linux host.
@@ -60,6 +61,7 @@ COMPOSE_PROFILES="${COMPOSE_PROFILES:-}"    # comma-separated, e.g. prod,monitor
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
 COMPOSE_BIN="${COMPOSE_BIN:-}"              # optional override, e.g. "docker compose" or "docker-compose"
 COMPOSE_SCALE="${COMPOSE_SCALE:-}"          # comma-separated, e.g. job-analyzer=2,message-dispatcher=1
+COMPOSE_BUILD="${COMPOSE_BUILD:-auto}"      # auto=build on git changes; always=always build; never=never build
 
 log() {
   printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"
@@ -73,8 +75,10 @@ require_cmd() {
 }
 
 run_compose() {
+  local changed="${1:-false}"
   local -a args
   local -a up_scale_args
+  local -a up_build_args
   IFS=' ' read -r -a compose_cmd <<<"${COMPOSE_BIN}"
 
   if [[ -n "${COMPOSE_FILES}" ]]; then
@@ -103,8 +107,26 @@ run_compose() {
     done
   fi
 
+  up_build_args=()
+  case "${COMPOSE_BUILD}" in
+    always)
+      up_build_args+=("--build")
+      ;;
+    auto)
+      if [[ "${changed}" == "true" ]]; then
+        up_build_args+=("--build")
+      fi
+      ;;
+    never)
+      ;;
+    *)
+      log "ERROR: invalid COMPOSE_BUILD=${COMPOSE_BUILD} (allowed: auto|always|never)"
+      exit 1
+      ;;
+  esac
+
   "${compose_cmd[@]}" "${args[@]}" pull
-  "${compose_cmd[@]}" "${args[@]}" up "${up_scale_args[@]}" -d --remove-orphans
+  "${compose_cmd[@]}" "${args[@]}" up "${up_scale_args[@]}" "${up_build_args[@]}" -d --remove-orphans
 }
 
 resolve_compose_bin() {
@@ -180,7 +202,7 @@ main() {
 
   if [[ "${ALWAYS_RECONCILE}" == "true" || "${changed}" == "true" ]]; then
     log "Reconciling Docker Compose"
-    run_compose
+    run_compose "${changed}"
     log "Reconciliation completed"
   else
     log "No new commits and ALWAYS_RECONCILE=false, skipping compose"

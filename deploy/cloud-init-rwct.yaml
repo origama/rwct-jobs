@@ -1,0 +1,148 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - jq
+
+write_files:
+  - path: /etc/default/rwct-jobs
+    permissions: "0640"
+    owner: root:root
+    content: |
+      # Repository settings
+      REPO_URL=https://github.com/origama/rwct-jobs.git
+      REPO_DIR=/opt/rwct-jobs
+      REPO_BRANCH=main
+
+      # Compose settings
+      COMPOSE_PROFILE=prod
+      COMPOSE_PROFILES=prod
+
+      # Optional model download URLs (leave empty to skip download)
+      MODEL_4B_URL=
+      MODEL_0_8B_URL=
+
+  - path: /usr/local/bin/rwct-bootstrap.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+
+      [[ -f /etc/default/rwct-jobs ]] && . /etc/default/rwct-jobs
+
+      REPO_URL="${REPO_URL:-https://github.com/origama/rwct-jobs.git}"
+      REPO_DIR="${REPO_DIR:-/opt/rwct-jobs}"
+      REPO_BRANCH="${REPO_BRANCH:-main}"
+      COMPOSE_PROFILE="${COMPOSE_PROFILE:-prod}"
+      MODEL_4B_URL="${MODEL_4B_URL:-}"
+      MODEL_0_8B_URL="${MODEL_0_8B_URL:-}"
+
+      log() { printf '[rwct-bootstrap] %s\n' "$*"; }
+
+      install_docker() {
+        if command -v docker >/dev/null 2>&1; then
+          log "docker already installed"
+          return
+        fi
+
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+        . /etc/os-release
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" >/etc/apt/sources.list.d/docker.list
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        systemctl enable --now docker
+      }
+
+      checkout_repo() {
+        mkdir -p /opt
+        if [[ -d "${REPO_DIR}/.git" ]]; then
+          git -C "${REPO_DIR}" fetch --prune origin "${REPO_BRANCH}"
+          git -C "${REPO_DIR}" checkout -q "${REPO_BRANCH}"
+          git -C "${REPO_DIR}" pull --ff-only origin "${REPO_BRANCH}"
+        else
+          git clone --branch "${REPO_BRANCH}" "${REPO_URL}" "${REPO_DIR}"
+        fi
+      }
+
+      setup_env_files() {
+        mkdir -p /etc/rwct-jobs
+        cp -n "${REPO_DIR}/.env.example" /etc/rwct-jobs/.env
+        cp -n "${REPO_DIR}/.env.secrets.example" /etc/rwct-jobs/.env.secrets
+        chmod 600 /etc/rwct-jobs/.env /etc/rwct-jobs/.env.secrets
+        chown root:root /etc/rwct-jobs/.env /etc/rwct-jobs/.env.secrets
+        ln -sfn /etc/rwct-jobs/.env "${REPO_DIR}/.env"
+        ln -sfn /etc/rwct-jobs/.env.secrets "${REPO_DIR}/.env.secrets"
+      }
+
+      setup_models() {
+        mkdir -p "${REPO_DIR}/models"
+
+        if [[ -n "${MODEL_4B_URL}" && ! -f "${REPO_DIR}/models/Qwen3.5-4B-Q4_K_M.gguf" ]]; then
+          log "downloading 4B model"
+          curl -fL --retry 5 --retry-delay 5 -o "${REPO_DIR}/models/Qwen3.5-4B-Q4_K_M.gguf" "${MODEL_4B_URL}"
+        fi
+
+        if [[ -n "${MODEL_0_8B_URL}" && ! -f "${REPO_DIR}/models/Qwen3.5-0.8B-Q4_K_M.gguf" ]]; then
+          log "downloading 0.8B model"
+          curl -fL --retry 5 --retry-delay 5 -o "${REPO_DIR}/models/Qwen3.5-0.8B-Q4_K_M.gguf" "${MODEL_0_8B_URL}"
+        fi
+      }
+
+      initial_deploy() {
+        cd "${REPO_DIR}"
+        docker compose --profile "${COMPOSE_PROFILE}" up -d --build
+      }
+
+      install_docker
+      checkout_repo
+      setup_env_files
+      setup_models
+      initial_deploy
+
+  - path: /etc/systemd/system/gitops-reconcile.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=RWCT GitOps reconcile (git pull + docker compose)
+      After=network-online.target docker.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      EnvironmentFile=-/etc/default/rwct-jobs
+      Environment=REPO_DIR=/opt/rwct-jobs
+      Environment=BRANCH=main
+      Environment=ALWAYS_RECONCILE=true
+      WorkingDirectory=/opt/rwct-jobs
+      ExecStart=/opt/rwct-jobs/scripts/gitops-reconcile.sh
+
+  - path: /etc/systemd/system/gitops-reconcile.timer
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Run RWCT GitOps reconciliation every minute
+
+      [Timer]
+      OnBootSec=1m
+      OnUnitActiveSec=1m
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  - [bash, -lc, "/usr/local/bin/rwct-bootstrap.sh"]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, gitops-reconcile.timer]
+
+final_message: "RWCT bootstrap completed. Check: systemctl status gitops-reconcile.timer && docker compose -f /opt/rwct-jobs/docker-compose.yml ps"

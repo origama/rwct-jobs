@@ -41,7 +41,8 @@
 #
 # Useful environment variables:
 #   REPO_DIR, REMOTE, BRANCH, LOCK_FILE, ALWAYS_RECONCILE,
-#   COMPOSE_FILES, COMPOSE_PROFILES, COMPOSE_PROJECT_NAME, COMPOSE_BIN
+#   COMPOSE_FILES, COMPOSE_PROFILES, COMPOSE_PROJECT_NAME, COMPOSE_BIN,
+#   COMPOSE_SCALE (e.g. "job-analyzer=2,message-dispatcher=1")
 set -Eeuo pipefail
 
 # GitOps pull + Docker Compose reconciliation for a single Linux host.
@@ -58,6 +59,7 @@ COMPOSE_FILES="${COMPOSE_FILES:-}"          # colon-separated, e.g. docker-compo
 COMPOSE_PROFILES="${COMPOSE_PROFILES:-}"    # comma-separated, e.g. prod,monitoring
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
 COMPOSE_BIN="${COMPOSE_BIN:-}"              # optional override, e.g. "docker compose" or "docker-compose"
+COMPOSE_SCALE="${COMPOSE_SCALE:-}"          # comma-separated, e.g. job-analyzer=2,message-dispatcher=1
 
 log() {
   printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"
@@ -72,6 +74,7 @@ require_cmd() {
 
 run_compose() {
   local -a args
+  local -a up_args
   IFS=' ' read -r -a compose_cmd <<<"${COMPOSE_BIN}"
 
   if [[ -n "${COMPOSE_FILES}" ]]; then
@@ -92,8 +95,16 @@ run_compose() {
     args+=("--project-name" "${COMPOSE_PROJECT_NAME}")
   fi
 
+  up_args=("${args[@]}")
+  if [[ -n "${COMPOSE_SCALE}" ]]; then
+    IFS=',' read -r -a scales <<<"${COMPOSE_SCALE}"
+    for s in "${scales[@]}"; do
+      [[ -n "${s}" ]] && up_args+=("--scale" "${s}")
+    done
+  fi
+
   "${compose_cmd[@]}" "${args[@]}" pull
-  "${compose_cmd[@]}" "${args[@]}" up -d --remove-orphans
+  "${compose_cmd[@]}" "${up_args[@]}" up -d --remove-orphans
 }
 
 resolve_compose_bin() {

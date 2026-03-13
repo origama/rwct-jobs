@@ -1,5 +1,6 @@
 models/
 .env
+.env.secrets
 .codex/
 .data/
 *.db

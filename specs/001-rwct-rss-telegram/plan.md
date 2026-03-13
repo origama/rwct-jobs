@@ -121,6 +121,8 @@ Payload policy:
 6. Rendere esplicita e supportata la configurazione della modalita` `thinking` del modello nell'analyzer.
 7. Ridurre query N+1 nel `web-admin` usando query aggregate.
 8. Allineare le capability configurabili alle feature effettivamente implementate, in particolare sulla concorrenza analyzer.
+9. Introdurre fallback opzionale di scraping con browser headless (feature flag) per pagine protette da anti-bot/JS challenge, con rate limit basso, cache e degradazione controllata a contenuto RSS-only.
+10. Implementare nel `web-admin` una webview multi-scheda con viste operative per item per feed, item per queue e item per stato.
 
 ## Complexity Tracking
 

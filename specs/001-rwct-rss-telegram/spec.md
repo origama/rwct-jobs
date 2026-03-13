@@ -151,3 +151,5 @@ Come maintainer RWCT voglio controllare frequenza polling, limiti uso LLM, rate 
 - Uniformare startup/shutdown di health server e telemetry.
 - Allineare configurazioni dichiarate e capability reali del runtime, inclusa la concorrenza analyzer.
 - Ottimizzare le query del `web-admin` per evitare pattern N+1 sulle dashboard.
+- Aggiungere fallback opzionale di source-enrichment via browser headless (feature flag), da usare solo su domini bloccati da anti-bot/JS challenge con rate limit stretto, cache e fallback sicuro al solo contenuto RSS senza inferenze.
+- Introdurre nel `web-admin` una webview multi-scheda per esplorazione operativa: viste dedicate per item per feed, item per queue e item per stato con filtri coerenti e aggiornamento affidabile.

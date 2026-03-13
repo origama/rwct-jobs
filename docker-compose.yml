@@ -51,7 +51,9 @@ services:
         SERVICE: rss-reader
     container_name: rwct-rss-reader
     profiles: ["dev", "prod"]
-    env_file: .env
+    env_file:
+      - .env
+      - .env.secrets
     environment:
       HEALTH_PORT: 8081
       RSS_POLL_INTERVAL: 1m
@@ -72,7 +74,9 @@ services:
       context: .
       dockerfile: Dockerfile.analyzer-llama
     profiles: ["dev", "prod"]
-    env_file: .env
+    env_file:
+      - .env
+      - .env.secrets
     environment:
       HEALTH_PORT: 8082
       LLM_ENDPOINT: http://127.0.0.1:8080
@@ -99,7 +103,9 @@ services:
         SERVICE: message-dispatcher
     container_name: rwct-message-dispatcher
     profiles: ["dev", "prod"]
-    env_file: .env
+    env_file:
+      - .env
+      - .env.secrets
     environment:
       HEALTH_PORT: 8083
       DESTINATION_MODE: ${DESTINATION_MODE:-file}
@@ -120,7 +126,9 @@ services:
         SERVICE: web-admin
     container_name: rwct-web-admin
     profiles: ["dev", "prod"]
-    env_file: .env
+    env_file:
+      - .env
+      - .env.secrets
     environment:
       WEB_ADMIN_PORT: ${WEB_ADMIN_PORT:-8090}
     ports:

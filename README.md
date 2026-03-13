@@ -23,6 +23,7 @@ Per i diagrammi completi delle state machine/lifecycle:
 
 ```bash
 cp .env.example .env
+cp .env.secrets.example .env.secrets
 docker compose --profile dev up --build
 ```
 
@@ -46,8 +47,8 @@ docker compose --profile prod up --build
 
 Per usare Telegram impostare:
 - `DESTINATION_MODE=telegram`
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+- `TELEGRAM_BOT_TOKEN` (in `.env.secrets`)
+- `TELEGRAM_CHAT_ID` (in `.env.secrets`)
 
 Opzionali:
 - `TELEGRAM_THREAD_ID`

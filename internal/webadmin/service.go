@@ -17,6 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"rwct-agent/pkg/events"
+	"rwct-agent/pkg/telemetry"
 )
 
 type Config struct {
@@ -332,7 +333,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.http = &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.cfg.HTTPPort),
-		Handler: mux,
+		Handler: telemetry.WrapHTTPHandler(mux, "web-admin-http"),
 	}
 
 	go func() {

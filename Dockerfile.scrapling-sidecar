@@ -11,6 +11,11 @@ RUN pip install --no-cache-dir \
     beautifulsoup4 \
     lxml \
     markdownify \
+    opentelemetry-sdk \
+    opentelemetry-exporter-otlp-proto-grpc \
+    opentelemetry-instrumentation-flask \
+    opentelemetry-instrumentation-requests \
+    requests \
     "scrapling[fetchers]"
 
 COPY sidecars/scrapling_sidecar/app.py /app/app.py

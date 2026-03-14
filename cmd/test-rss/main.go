@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/xml"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"rwct-agent/pkg/telemetry"
 )
 
 const (
@@ -140,8 +145,21 @@ var (
 )
 
 func main() {
-	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
-	slog.SetDefault(slog.New(h))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	logger, shutdownTelemetry, err := telemetry.Bootstrap(ctx, telemetry.BootstrapConfig{
+		Endpoint:       getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		ServiceName:    "test-rss",
+		ServiceVersion: getenv("SERVICE_VERSION", "dev"),
+		Environment:    getenv("DEPLOY_ENV", "local"),
+		Level:          slog.LevelInfo,
+		Insecure:       getenvBool("OTEL_EXPORTER_OTLP_INSECURE", true),
+	})
+	slog.SetDefault(logger)
+	if err != nil {
+		slog.Error("otel init failed", "err", err)
+	}
+	defer func() { _ = shutdownTelemetry(context.Background()) }()
 
 	cfg := config{
 		Port:            getenvInt("TEST_RSS_PORT", defaultPort),
@@ -175,6 +193,17 @@ func main() {
 		serveIndex(w, r, cfg)
 	})
 
+	handler := telemetry.WrapHTTPHandler(mux, "test-rss-http")
+	srv := &http.Server{
+		Addr:    listenAddr,
+		Handler: handler,
+	}
+
+	go func() {
+		<-ctx.Done()
+		_ = srv.Shutdown(context.Background())
+	}()
+
 	slog.Info(
 		"test rss site started",
 		"addr", listenAddr,
@@ -184,7 +213,7 @@ func main() {
 		"publish_interval", cfg.PublishInterval.String(),
 		"max_feed_items", cfg.MaxFeedItems,
 	)
-	if err := http.ListenAndServe(listenAddr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("test rss site stopped", "err", err)
 		os.Exit(1)
 	}
@@ -437,6 +466,21 @@ func getenvInt(k string, def int) int {
 		return def
 	}
 	return n
+}
+
+func getenvBool(k string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "true", "TRUE", "yes", "YES", "on", "ON":
+		return true
+	case "0", "false", "FALSE", "no", "NO", "off", "OFF":
+		return false
+	default:
+		return def
+	}
 }
 
 func getenvDuration(k string, def time.Duration) time.Duration {

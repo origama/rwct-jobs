@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -18,10 +19,15 @@ import (
 	"time"
 
 	"github.com/mmcdole/gofeed"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	_ "modernc.org/sqlite"
 
 	"rwct-agent/pkg/events"
 	"rwct-agent/pkg/retry"
+	"rwct-agent/pkg/telemetry"
 )
 
 var (
@@ -50,6 +56,14 @@ type Service struct {
 	cfg    Config
 	db     *sql.DB
 	parser *gofeed.Parser
+	http   *http.Client
+
+	tracer trace.Tracer
+
+	pollDurationSec   otelmetric.Float64Histogram
+	itemsEnqueued     otelmetric.Int64Counter
+	itemsDuplicate    otelmetric.Int64Counter
+	itemsProcessError otelmetric.Int64Counter
 }
 
 func New(cfg Config) (*Service, error) {
@@ -60,7 +74,30 @@ func New(cfg Config) (*Service, error) {
 	if err := initDB(db); err != nil {
 		return nil, err
 	}
-	return &Service{cfg: cfg, db: db, parser: gofeed.NewParser()}, nil
+	client := &http.Client{
+		Transport: telemetry.NewHTTPTransport(http.DefaultTransport),
+		Timeout:   20 * time.Second,
+	}
+	parser := gofeed.NewParser()
+	parser.Client = client
+
+	meter := otel.Meter("rwct-agent/rss-reader")
+	pollDurationSec, _ := meter.Float64Histogram("rwct_rss_poll_duration_seconds", otelmetric.WithDescription("Duration of RSS feed polling runs"))
+	itemsEnqueued, _ := meter.Int64Counter("rwct_rss_items_enqueued_total", otelmetric.WithDescription("Number of new RSS items enqueued for analysis"))
+	itemsDuplicate, _ := meter.Int64Counter("rwct_rss_items_duplicate_total", otelmetric.WithDescription("Number of duplicate RSS items skipped"))
+	itemsProcessError, _ := meter.Int64Counter("rwct_rss_item_errors_total", otelmetric.WithDescription("Number of RSS item processing errors"))
+
+	return &Service{
+		cfg:               cfg,
+		db:                db,
+		parser:            parser,
+		http:              client,
+		tracer:            otel.Tracer("rwct-agent/rss-reader"),
+		pollDurationSec:   pollDurationSec,
+		itemsEnqueued:     itemsEnqueued,
+		itemsDuplicate:    itemsDuplicate,
+		itemsProcessError: itemsProcessError,
+	}, nil
 }
 
 func sqliteDSN(path string) string {
@@ -288,11 +325,14 @@ func (s *Service) bootstrapMarkExisting(ctx context.Context, feeds []string) (in
 	totalPublished := 0
 	totalMarked := 0
 	for _, feedURL := range feeds {
+		feedCtx, feedSpan := s.tracer.Start(ctx, "rss.bootstrap.feed",
+			trace.WithAttributes(attribute.String("feed.url", feedURL)))
 		var feed *gofeed.Feed
-		err := retry.Exponential(ctx, s.cfg.RetryAttempts, s.cfg.RetryBaseDelay, func(attempt int) error {
-			parsed, e := s.parser.ParseURL(feedURL)
+		err := retry.Exponential(feedCtx, s.cfg.RetryAttempts, s.cfg.RetryBaseDelay, func(attempt int) error {
+			parsed, e := s.parser.ParseURLWithContext(feedURL, feedCtx)
 			if e != nil {
 				slog.Warn("bootstrap feed parse attempt failed", "feed_url", feedURL, "attempt", attempt, "err", e)
+				feedSpan.RecordError(e)
 				return e
 			}
 			feed = parsed
@@ -300,34 +340,54 @@ func (s *Service) bootstrapMarkExisting(ctx context.Context, feeds []string) (in
 		})
 		if err != nil {
 			slog.Error("bootstrap feed parse failed", "feed_url", feedURL, "err", err)
+			feedSpan.RecordError(err)
+			feedSpan.End()
 			continue
 		}
 		publishedForFeed := 0
 		for _, item := range feed.Items {
+			itemCtx, itemSpan := s.tracer.Start(feedCtx, "rss.bootstrap.item")
 			titleNorm := NormalizeTitle(item.Title)
 			dup, derr := s.isDuplicate(item.GUID, item.Link, titleNorm)
 			if derr != nil {
+				itemSpan.RecordError(derr)
+				s.itemsProcessError.Add(itemCtx, 1)
+				itemSpan.End()
 				continue
 			}
 			if dup {
+				s.itemsDuplicate.Add(itemCtx, 1)
+				itemSpan.End()
 				continue
 			}
 			shouldPublish := s.cfg.ColdStartItemsPerFeed > 0 && publishedForFeed < s.cfg.ColdStartItemsPerFeed
+			evt := toRawEvent(feedURL, item)
+			traceParent, traceState := telemetry.InjectTraceContext(itemCtx)
+			evt.TraceParent = traceParent
+			evt.TraceState = traceState
 			if shouldPublish {
-				evt := toRawEvent(feedURL, item)
 				if err := s.enqueueAnalyzerJob(evt); err != nil {
 					slog.Error("bootstrap enqueue raw failed", "feed_url", feedURL, "item_id", evt.ID, "err", err)
+					itemSpan.RecordError(err)
+					s.itemsProcessError.Add(itemCtx, 1)
+					itemSpan.End()
 					continue
 				}
+				s.itemsEnqueued.Add(itemCtx, 1)
 				publishedForFeed++
 				totalPublished++
 			}
-			if err := s.savePending(toRawEvent(feedURL, item).ID, item.GUID, item.Link, titleNorm); err != nil {
+			if err := s.savePending(evt.ID, item.GUID, item.Link, titleNorm); err != nil {
+				itemSpan.RecordError(err)
+				s.itemsProcessError.Add(itemCtx, 1)
+				itemSpan.End()
 				continue
 			}
 			totalMarked++
+			itemSpan.End()
 		}
 		slog.Info("bootstrap feed completed", "feed_url", feedURL, "items_published", publishedForFeed)
+		feedSpan.End()
 	}
 	return totalPublished, totalMarked, nil
 }
@@ -346,8 +406,23 @@ func (s *Service) pollOne(ctx context.Context, feedURL string) error {
 }
 
 func (s *Service) pollOneWithMode(ctx context.Context, feedURL string, force bool) error {
+	ctx, span := s.tracer.Start(ctx, "rss.poll.feed",
+		trace.WithAttributes(
+			attribute.String("feed.url", feedURL),
+			attribute.Bool("poll.force", force),
+		))
+	defer span.End()
+	started := time.Now()
+	defer s.pollDurationSec.Record(ctx, time.Since(started).Seconds(),
+		otelmetric.WithAttributes(
+			attribute.String("feed.url", feedURL),
+			attribute.Bool("poll.force", force),
+		),
+	)
+
 	ready, err := s.canPoll(feedURL)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 	if !ready && !force {
@@ -356,9 +431,10 @@ func (s *Service) pollOneWithMode(ctx context.Context, feedURL string, force boo
 
 	var feed *gofeed.Feed
 	err = retry.Exponential(ctx, s.cfg.RetryAttempts, s.cfg.RetryBaseDelay, func(attempt int) error {
-		parsed, e := s.parser.ParseURL(feedURL)
+		parsed, e := s.parser.ParseURLWithContext(feedURL, ctx)
 		if e != nil {
 			slog.Warn("feed parse attempt failed", "feed_url", feedURL, "attempt", attempt, "err", e)
+			span.RecordError(e)
 			return e
 		}
 		feed = parsed
@@ -366,10 +442,12 @@ func (s *Service) pollOneWithMode(ctx context.Context, feedURL string, force boo
 	})
 	if err != nil {
 		slog.Error("feed marked down after retries", "feed_url", feedURL, "err", err, "cooldown", s.cfg.CooldownRetry.String(), "force", force)
+		span.RecordError(err)
 		return s.markDown(feedURL)
 	}
 	if err := s.markUp(feedURL); err != nil {
 		slog.Warn("failed to mark feed up", "feed_url", feedURL, "err", err)
+		span.RecordError(err)
 	}
 
 	count := 0
@@ -377,21 +455,35 @@ func (s *Service) pollOneWithMode(ctx context.Context, feedURL string, force boo
 		if s.cfg.MaxItemsPerPoll > 0 && count >= s.cfg.MaxItemsPerPoll {
 			break
 		}
+		itemCtx, itemSpan := s.tracer.Start(ctx, "rss.poll.item")
 		evt := toRawEvent(feedURL, item)
+		traceParent, traceState := telemetry.InjectTraceContext(itemCtx)
+		evt.TraceParent = traceParent
+		evt.TraceState = traceState
 		inserted, ierr := s.insertItemIfNew(evt)
 		if ierr != nil {
 			slog.Error("failed to store item", "feed_url", feedURL, "err", ierr)
+			itemSpan.RecordError(ierr)
+			s.itemsProcessError.Add(itemCtx, 1)
+			itemSpan.End()
 			continue
 		}
 		if !inserted {
 			slog.Info("duplicate item skipped", "feed_url", feedURL, "guid", item.GUID, "url", item.Link, "title", item.Title, "item_hash", evt.ID)
+			s.itemsDuplicate.Add(itemCtx, 1)
+			itemSpan.End()
 			continue
 		}
 		if err := s.enqueueAnalyzerJob(evt); err != nil {
 			slog.Error("enqueue raw failed", "feed_url", feedURL, "item_id", evt.ID, "err", err)
+			itemSpan.RecordError(err)
+			s.itemsProcessError.Add(itemCtx, 1)
 			_ = s.markItemStatus(evt.ID, events.ItemStatusFailed, fmt.Sprintf("enqueue_raw_failed: %v", err))
+			itemSpan.End()
 			continue
 		}
+		s.itemsEnqueued.Add(itemCtx, 1)
+		itemSpan.End()
 		count++
 	}
 	slog.Info("feed polled", "feed_url", feedURL, "items_processed", count, "force", force)

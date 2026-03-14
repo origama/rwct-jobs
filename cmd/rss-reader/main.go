@@ -49,8 +49,8 @@ func getenvBool(k string, def bool) bool {
 }
 
 func main() {
-	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
-	slog.SetDefault(slog.New(h))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	cfg := rssreader.Config{
 		DBPath:                getenv("RSS_DB_PATH", "/data/rss-reader.db"),
@@ -68,16 +68,19 @@ func main() {
 		MaxItemsPerPoll:       getenvInt("RSS_MAX_ITEMS_PER_POLL", 100),
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	if endpoint := getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""); endpoint != "" {
-		shutdown, err := telemetry.InitMetrics(ctx, endpoint)
-		if err != nil {
-			slog.Error("otel metrics init failed", "err", err)
-		} else {
-			defer func() { _ = shutdown(context.Background()) }()
-		}
+	logger, shutdownTelemetry, err := telemetry.Bootstrap(ctx, telemetry.BootstrapConfig{
+		Endpoint:       getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		ServiceName:    "rss-reader",
+		ServiceVersion: getenv("SERVICE_VERSION", "dev"),
+		Environment:    getenv("DEPLOY_ENV", "local"),
+		Level:          slog.LevelInfo,
+		Insecure:       getenvBool("OTEL_EXPORTER_OTLP_INSECURE", true),
+	})
+	slog.SetDefault(logger)
+	if err != nil {
+		slog.Error("otel init failed", "err", err)
 	}
+	defer func() { _ = shutdownTelemetry(context.Background()) }()
 
 	_ = health.StartServer(cfg.HealthPort)
 

@@ -20,11 +20,16 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 	_ "modernc.org/sqlite"
 
 	"rwct-agent/pkg/events"
 	"rwct-agent/pkg/retry"
+	"rwct-agent/pkg/telemetry"
 )
 
 var allowedJobCategories = []string{
@@ -100,6 +105,14 @@ type Service struct {
 	http     *http.Client
 	limiter  *rate.Limiter
 	workerID string
+
+	tracer trace.Tracer
+
+	analyzeDurationSec   otelmetric.Float64Histogram
+	llmDurationSec       otelmetric.Float64Histogram
+	jobsProcessed        otelmetric.Int64Counter
+	jobsFailed           otelmetric.Int64Counter
+	sourceScrapeFailures otelmetric.Int64Counter
 }
 
 func New(cfg Config) (*Service, error) {
@@ -162,11 +175,24 @@ func New(cfg Config) (*Service, error) {
 		return nil, err
 	}
 	return &Service{
-		cfg:      cfg,
-		db:       db,
-		http:     &http.Client{},
+		cfg: cfg,
+		db:  db,
+		http: &http.Client{
+			Transport: telemetry.NewHTTPTransport(http.DefaultTransport),
+		},
 		limiter:  rate.NewLimiter(rate.Every(time.Minute/time.Duration(cfg.MaxJobsPerMin)), 1),
 		workerID: fmt.Sprintf("%s-%d", safeHostname(), time.Now().UTC().UnixNano()),
+		tracer:   otel.Tracer("rwct-agent/job-analyzer"),
+		analyzeDurationSec: mustFloat64Histogram("rwct_analyzer_duration_seconds",
+			"Duration of analyzer jobs"),
+		llmDurationSec: mustFloat64Histogram("rwct_analyzer_llm_duration_seconds",
+			"Duration of LLM requests from analyzer"),
+		jobsProcessed: mustInt64Counter("rwct_analyzer_jobs_total",
+			"Number of analyzer jobs processed"),
+		jobsFailed: mustInt64Counter("rwct_analyzer_job_failures_total",
+			"Number of analyzer jobs that failed"),
+		sourceScrapeFailures: mustInt64Counter("rwct_analyzer_source_scrape_failures_total",
+			"Number of source-page scraping failures"),
 	}, nil
 }
 
@@ -175,6 +201,57 @@ func sqliteDSN(path string) string {
 		return path + "&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 	}
 	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+}
+
+func analyzerMeter() otelmetric.Meter {
+	return otel.Meter("rwct-agent/job-analyzer")
+}
+
+func mustFloat64Histogram(name, description string) otelmetric.Float64Histogram {
+	h, _ := analyzerMeter().Float64Histogram(name, otelmetric.WithDescription(description))
+	return h
+}
+
+func mustInt64Counter(name, description string) otelmetric.Int64Counter {
+	c, _ := analyzerMeter().Int64Counter(name, otelmetric.WithDescription(description))
+	return c
+}
+
+func (s *Service) tracerForUse() trace.Tracer {
+	if s.tracer != nil {
+		return s.tracer
+	}
+	return otel.Tracer("rwct-agent/job-analyzer")
+}
+
+func (s *Service) recordAnalyzeDuration(ctx context.Context, seconds float64, opts ...otelmetric.RecordOption) {
+	if s.analyzeDurationSec != nil {
+		s.analyzeDurationSec.Record(ctx, seconds, opts...)
+	}
+}
+
+func (s *Service) recordLLMDuration(ctx context.Context, seconds float64, opts ...otelmetric.RecordOption) {
+	if s.llmDurationSec != nil {
+		s.llmDurationSec.Record(ctx, seconds, opts...)
+	}
+}
+
+func (s *Service) addProcessed(ctx context.Context, opts ...otelmetric.AddOption) {
+	if s.jobsProcessed != nil {
+		s.jobsProcessed.Add(ctx, 1, opts...)
+	}
+}
+
+func (s *Service) addFailed(ctx context.Context, opts ...otelmetric.AddOption) {
+	if s.jobsFailed != nil {
+		s.jobsFailed.Add(ctx, 1, opts...)
+	}
+}
+
+func (s *Service) addSourceFailure(ctx context.Context, opts ...otelmetric.AddOption) {
+	if s.sourceScrapeFailures != nil {
+		s.sourceScrapeFailures.Add(ctx, 1, opts...)
+	}
 }
 
 func initStateDB(db *sql.DB) error {
@@ -355,20 +432,33 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) handleClaimedMessage(ctx context.Context, itemID string, payload []byte) error {
+	started := time.Now()
 	var in events.RawJobItem
 	if err := json.Unmarshal(payload, &in); err != nil {
 		_ = s.releaseClaim(itemID, fmt.Sprintf("invalid_raw_payload: %v", err))
+		s.addFailed(ctx, otelmetric.WithAttributes(attribute.String("reason", "invalid_raw_payload")))
 		return err
 	}
 	if strings.TrimSpace(in.ID) == "" {
 		in.ID = itemID
 	}
+	ctx = telemetry.ExtractTraceContext(ctx, in.TraceParent, in.TraceState)
+	ctx, span := s.tracerForUse().Start(ctx, "analyzer.handle_item",
+		trace.WithAttributes(
+			attribute.String("item.id", in.ID),
+			attribute.String("item.url", in.URL),
+		))
+	defer span.End()
+	defer s.recordAnalyzeDuration(ctx, time.Since(started).Seconds())
 
 	if already, analyzedPayload, err := s.loadStoredAnalyzed(in.ID); err == nil && already {
 		if err := s.enqueueDispatchJob(in.ID, []byte(analyzedPayload)); err != nil {
 			_ = s.releaseClaim(itemID, fmt.Sprintf("enqueue_stored_dispatch_failed: %v", err))
+			span.RecordError(err)
+			s.addFailed(ctx, otelmetric.WithAttributes(attribute.String("reason", "enqueue_stored_dispatch_failed")))
 			return err
 		}
+		s.addProcessed(ctx, otelmetric.WithAttributes(attribute.String("status", "cached")))
 		return s.completeClaim(itemID)
 	}
 
@@ -378,6 +468,7 @@ func (s *Service) handleClaimedMessage(ctx context.Context, itemID string, paylo
 		if e != nil {
 			_ = s.markItemStatus(in.ID, events.ItemStatusFailed, e.Error(), nil)
 			s.publishError(in.ID, attempt, "llm_call_failed", e)
+			span.RecordError(e)
 			return e
 		}
 		analyzed = out
@@ -385,6 +476,7 @@ func (s *Service) handleClaimedMessage(ctx context.Context, itemID string, paylo
 	})
 	if err != nil {
 		slog.Error("analysis failed after retries", "item_id", in.ID, "err", err)
+		s.addFailed(ctx, otelmetric.WithAttributes(attribute.String("reason", "analysis_failed")))
 		if s.shouldQuarantineClaim(itemID, err) {
 			reason := fmt.Sprintf("poison_item: analysis_failed: %v", err)
 			_ = s.markItemStatus(in.ID, events.ItemStatusFailed, reason, nil)
@@ -400,8 +492,11 @@ func (s *Service) handleClaimedMessage(ctx context.Context, itemID string, paylo
 	body, _ := json.Marshal(analyzed)
 	if err := s.enqueueDispatchJob(in.ID, body); err != nil {
 		_ = s.releaseClaim(itemID, fmt.Sprintf("enqueue_dispatch_failed: %v", err))
+		span.RecordError(err)
+		s.addFailed(ctx, otelmetric.WithAttributes(attribute.String("reason", "enqueue_dispatch_failed")))
 		return err
 	}
+	s.addProcessed(ctx, otelmetric.WithAttributes(attribute.String("status", "success")))
 	return s.completeClaim(itemID)
 }
 
@@ -560,10 +655,21 @@ func (s *Service) publishError(itemID string, attempt int, code string, err erro
 }
 
 func (s *Service) analyze(ctx context.Context, in events.RawJobItem) (events.AnalyzedJob, error) {
+	ctx, span := s.tracerForUse().Start(ctx, "analyzer.analyze",
+		trace.WithAttributes(
+			attribute.String("item.id", in.ID),
+			attribute.String("source.extractor", s.cfg.SourceExtractor),
+		))
+	defer span.End()
+
 	sourcePageText := ""
 	if body, err := s.fetchSourcePageExcerpt(ctx, in.URL); err == nil {
 		sourcePageText = body
 	} else if strings.TrimSpace(in.URL) != "" {
+		span.RecordError(err)
+		s.addSourceFailure(ctx, otelmetric.WithAttributes(
+			attribute.String("extractor", s.cfg.SourceExtractor),
+		))
 		slog.Warn(
 			"source page scraping failed; continuing with feed payload only",
 			"item_id", in.ID,
@@ -575,10 +681,14 @@ func (s *Service) analyze(ctx context.Context, in events.RawJobItem) (events.Ana
 
 	content, err := s.callLLM(ctx, s.buildPromptForLLM(in, sourcePageText), s.cfg.LLMMaxTokens)
 	if err != nil {
+		span.RecordError(err)
 		return events.AnalyzedJob{}, err
 	}
 	out, parseErr := parseAnalyzedJob(content, in)
 	if parseErr == nil {
+		traceParent, traceState := telemetry.InjectTraceContext(ctx)
+		out.TraceParent = traceParent
+		out.TraceState = traceState
 		return out, nil
 	}
 
@@ -594,14 +704,20 @@ func (s *Service) analyze(ctx context.Context, in events.RawJobItem) (events.Ana
 		slog.Warn("llm returned truncated json, retrying compact mode", "item_id", in.ID, "max_tokens", fallbackTokens)
 		content2, err2 := s.callLLM(ctx, s.buildCompactPromptForLLM(in, sourcePageText), fallbackTokens)
 		if err2 != nil {
+			span.RecordError(err2)
 			return events.AnalyzedJob{}, err2
 		}
 		out2, parseErr2 := parseAnalyzedJob(content2, in)
 		if parseErr2 == nil {
+			traceParent, traceState := telemetry.InjectTraceContext(ctx)
+			out2.TraceParent = traceParent
+			out2.TraceState = traceState
 			return out2, nil
 		}
+		span.RecordError(parseErr2)
 		return events.AnalyzedJob{}, parseErr2
 	}
+	span.RecordError(parseErr)
 	return events.AnalyzedJob{}, parseErr
 }
 
@@ -744,6 +860,17 @@ func stripMarkdownCodeFence(v string) string {
 }
 
 func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (string, error) {
+	ctx, span := s.tracerForUse().Start(ctx, "analyzer.call_llm",
+		trace.WithAttributes(
+			attribute.Int("llm.max_tokens", maxTokens),
+			attribute.Int("prompt.chars", len(prompt)),
+			attribute.String("llm.model", s.cfg.LLMModel),
+		))
+	defer span.End()
+	started := time.Now()
+	defer s.recordLLMDuration(ctx, time.Since(started).Seconds(),
+		otelmetric.WithAttributes(attribute.String("llm.model", s.cfg.LLMModel)))
+
 	timeout := s.computeLLMTimeout(prompt, maxTokens)
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -764,17 +891,22 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(s.cfg.LLMEndpoint, "/")+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
+		span.RecordError(err)
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.http.Do(req)
 	if err != nil {
+		span.RecordError(err)
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("llm status: %d", resp.StatusCode)
+		err := fmt.Errorf("llm status: %d", resp.StatusCode)
+		span.RecordError(err)
+		span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+		return "", err
 	}
 
 	var r struct {
@@ -785,10 +917,13 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 		} `json:"choices"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		span.RecordError(err)
 		return "", err
 	}
 	if len(r.Choices) == 0 {
-		return "", errors.New("empty llm response")
+		err := errors.New("empty llm response")
+		span.RecordError(err)
+		return "", err
 	}
 	return stripMarkdownCodeFence(strings.TrimSpace(r.Choices[0].Message.Content)), nil
 }

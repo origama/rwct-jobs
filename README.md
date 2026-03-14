@@ -10,6 +10,9 @@ Pipeline a microservizi Go: `RSS -> SQLite queue -> LLM analyzer -> dispatcher`.
 - `message-dispatcher`: consuma `dispatch_queue`, renderizza template markdown e invia a file o Telegram.
 - `web-admin`: UI per feed management, monitor code, runtime analyzer, requeue item e ispezione payload analizzati.
 - `test-rss`: mini-sito di test che espone feed RSS (`/feed.rss`) e pagine annuncio locali (`/jobs/...`) generate a intervallo configurabile.
+- `otel-collector`: riceve metriche/log/tracce via OTLP da tutti i componenti e inoltra verso backend osservabilità.
+- `prometheus`, `loki`, `tempo`: backend locali per metriche, log e tracce.
+- `grafana`: dashboard e correlazione tra metriche/log/tracce.
 
 ## Stato e queue
 
@@ -38,6 +41,24 @@ Profilo produzione (llama.cpp):
 docker compose --profile prod up --build
 ```
 
+Stack observability locale (profilo separato):
+
+```bash
+docker compose --profile obs up -d
+```
+
+Per avviare tutto insieme (`prod` + observability):
+
+```bash
+docker compose --profile prod --profile obs up --build
+```
+
+Endpoint observability:
+- Grafana: `http://localhost:${GRAFANA_PORT:-3000}` (default `admin/admin`)
+- Prometheus: `http://localhost:9090`
+- Loki: `http://localhost:3100`
+- Tempo: `http://localhost:3200`
+
 ## Configurazione analyzer (chiavi principali)
 
 - `LLM_MODEL`, `LLM_ENDPOINT`, `LLM_TIMEOUT`, `LLM_MAX_TOKENS`
@@ -55,6 +76,20 @@ docker compose --profile prod up --build
 - `ANALYZER_SCRAPLING_MAX_CHARS` (default `10000`): clamp testo estratto da Scrapling.
 - `ANALYZER_MAX_DELIVERY_ATTEMPTS` (default `3`): soglia anti-poison item su `analyzer_queue`.
 - `LLM_PARALLEL_THREADS` (default `-1`): numero thread CPU per `llama.cpp` (`-t`, auto-detect quando `-1`).
+
+## OpenTelemetry / Observability
+
+Tutti i componenti (`rss-reader`, `job-analyzer`, `message-dispatcher`, `web-admin`, `test-rss`, `llm-mock`, `scrapling-sidecar`) sono instrumentati con OpenTelemetry SDK e inviano segnali all'OTel Collector locale.
+
+Variabili principali:
+- `OTEL_EXPORTER_OTLP_ENDPOINT` (default `otel-collector:4317`)
+- `OTEL_EXPORTER_OTLP_INSECURE` (default `true`)
+- `SERVICE_VERSION` (default `dev`)
+- `DEPLOY_ENV` (default `local`)
+
+Dashboard provisionata automaticamente:
+- `RWCT Observability Overview` (Grafana folder `RWCT`)
+- file: `observability/grafana/dashboards/rwct-overview.json`
 
 ## Telegram
 
@@ -85,6 +120,7 @@ Template:
 ## Troubleshooting
 
 - [Troubleshooting operativo](docs/troubleshooting.md)
+- [Osservability stack](docs/observability-stack.md)
 
 ## Test
 

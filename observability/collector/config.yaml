@@ -20,29 +20,32 @@ exporters:
     endpoint: 0.0.0.0:8889
     resource_to_telemetry_conversion:
       enabled: true
-  otlp_http/loki:
-    endpoint: http://loki:3100/otlp
-  otlp_grpc/tempo:
-    endpoint: tempo:4317
-    tls:
-      insecure: true
+  otlp_http/grafana_cloud:
+    endpoint: https://otlp-gateway-prod-eu-west-0.grafana.net/otlp
+    auth:
+      authenticator: basicauth/grafana_cloud
+    compression: gzip
 
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
+  basicauth/grafana_cloud:
+    client_auth:
+      username: ${GRAFANA_INSTANCE_ID}
+      password: ${GRAFANA_TOKEN}
 
 service:
-  extensions: [health_check]
+  extensions: [health_check, basicauth/grafana_cloud]
   pipelines:
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [prometheus]
+      exporters: [prometheus, otlp_http/grafana_cloud]
     logs:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlp_http/loki]
+      exporters: [otlp_http/grafana_cloud]
     traces:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlp_grpc/tempo]
+      exporters: [otlp_http/grafana_cloud]

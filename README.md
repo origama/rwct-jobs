@@ -41,7 +41,9 @@ Profilo produzione (llama.cpp):
 docker compose --profile prod up --build
 ```
 
-Stack observability locale (profilo separato):
+`otel-collector` viene avviato sempre (anche senza `obs`) e inoltra i segnali OTLP a Grafana Cloud.
+
+Stack observability locale opzionale (profilo separato):
 
 ```bash
 docker compose --profile obs up -d
@@ -53,7 +55,7 @@ Per avviare tutto insieme (`prod` + observability):
 docker compose --profile prod --profile obs up --build
 ```
 
-Endpoint observability:
+Endpoint observability locale (solo profilo `obs`):
 - Grafana: `http://localhost:${GRAFANA_PORT:-3000}` (default `admin/admin`)
 - Prometheus: `http://localhost:9090`
 - Loki: `http://localhost:3100`
@@ -86,6 +88,12 @@ Variabili principali:
 - `OTEL_EXPORTER_OTLP_INSECURE` (default `true`)
 - `SERVICE_VERSION` (default `dev`)
 - `DEPLOY_ENV` (default `local`)
+
+Forwarding Grafana Cloud (collector):
+- endpoint OTLP: `https://otlp-gateway-prod-eu-west-0.grafana.net/otlp`
+- credenziali in `.env.secrets`:
+  - `GRAFANA_INSTANCE_ID`
+  - `GRAFANA_TOKEN`
 
 Dashboard provisionata automaticamente:
 - `RWCT Observability Overview` (Grafana folder `RWCT`)

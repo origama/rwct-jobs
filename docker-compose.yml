@@ -8,8 +8,9 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.147.0
     container_name: rwct-otel-collector
-    profiles: ["obs"]
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    env_file:
+      - .env.secrets
     volumes:
       - ./observability/collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
@@ -92,6 +93,9 @@ services:
     profiles: ["dev"]
     environment:
       <<: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/healthz | grep -q ok"]
       interval: 15s
@@ -112,6 +116,9 @@ services:
       <<: *otel-env
       TEST_RSS_PORT: 8095
       TEST_RSS_BASE_URL: http://test-rss:8095
+    depends_on:
+      otel-collector:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://localhost:8095/healthz | grep -q ok"]
       interval: 20s
@@ -149,6 +156,8 @@ services:
     depends_on:
       test-rss:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
     volumes:
       - rwct-data:/data
       - ./configs:/app/configs:ro
@@ -168,6 +177,9 @@ services:
       - "8088:8088"
     environment:
       <<: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8088/healthz', timeout=3).read()\""]
       interval: 20s
@@ -194,6 +206,8 @@ services:
     depends_on:
       scrapling-sidecar:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
     volumes:
       - rwct-data:/data
       - ./configs:/app/configs:ro
@@ -219,6 +233,9 @@ services:
       <<: *otel-env
       HEALTH_PORT: 8083
       DESTINATION_MODE: ${DESTINATION_MODE:-file}
+    depends_on:
+      otel-collector:
+        condition: service_started
     volumes:
       - rwct-data:/data
       - ./configs:/app/configs:ro
@@ -242,6 +259,9 @@ services:
     environment:
       <<: *otel-env
       WEB_ADMIN_PORT: ${WEB_ADMIN_PORT:-8090}
+    depends_on:
+      otel-collector:
+        condition: service_started
     ports:
       - "${WEB_ADMIN_PORT:-8090}:${WEB_ADMIN_PORT:-8090}"
     volumes:

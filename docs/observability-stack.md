@@ -1,14 +1,15 @@
-# Observability Stack (OTel + Prometheus/Loki/Tempo/Grafana)
+# Observability Stack (OTel Collector + Grafana Cloud OTLP)
 
 ## Architettura
 
 Tutti i componenti applicativi inviano segnali OpenTelemetry all'istanza locale `otel-collector`:
 
-- Metriche: OTel SDK -> OTLP gRPC -> `otel-collector` -> exporter Prometheus (`:8889`) -> `prometheus`
-- Log: OTel SDK/bridge slog -> OTLP gRPC -> `otel-collector` -> exporter Loki -> `loki`
-- Tracce: OTel SDK -> OTLP gRPC -> `otel-collector` -> exporter OTLP -> `tempo`
+- Metriche: OTel SDK -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
+- Log: OTel SDK/bridge slog -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
+- Tracce: OTel SDK -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
 
-Grafana e` preconfigurato con datasource Prometheus/Loki/Tempo e dashboard `RWCT Observability Overview`.
+L'endpoint di destinazione e`:
+`https://otlp-gateway-prod-eu-west-0.grafana.net/otlp`
 
 ## Componenti instrumentati
 
@@ -33,45 +34,38 @@ Questo consente di seguire il flusso distribuito:
 ## Avvio locale
 
 ```bash
-docker compose --profile obs up -d
+docker compose --profile prod up -d --build
 ```
 
-Per affiancare observability alla pipeline completa locale:
+Il collector parte sempre con il compose (non e` legato al profilo `obs`).
+
+Per avviare anche lo stack locale di visualizzazione:
 
 ```bash
 docker compose --profile prod --profile obs up -d --build
 ```
 
-Endpoint utili:
+Credenziali richieste in `.env.secrets`:
 
-- Grafana: `http://localhost:3000`
-- Prometheus: `http://localhost:9090`
-- Loki: `http://localhost:3100`
-- Tempo: `http://localhost:3200`
-- OTel Collector metrics: `http://localhost:8888/metrics`
-- OTel Collector exported metrics: `http://localhost:8889/metrics`
+- `GRAFANA_INSTANCE_ID`
+- `GRAFANA_TOKEN`
 
 ## Verifica rapida
 
-Metriche (Prometheus):
+Collector:
 
-- `rwct_rss_items_enqueued_total`
-- `rwct_analyzer_jobs_total`
-- `rwct_analyzer_job_failures_total`
-- `rwct_dispatch_jobs_total`
-- `rwct_dispatch_job_failures_total`
-- `rwct_scrapling_extract_requests_total`
+- health: `http://localhost:13133/`
+- metrics interne collector: `http://localhost:8888/metrics`
+- endpoint Prometheus exporter collector: `http://localhost:8889/metrics`
 
-Log (Loki):
+Tracce/log/metriche:
 
-- query esempio:
-  `{service_name=~"rss-reader|job-analyzer|message-dispatcher|web-admin|test-rss|scrapling-sidecar|llm-mock"}`
+- verifica su Grafana Cloud (Explore/Traces/Metrics/Logs).
 
-Tracce (Tempo):
+Nota sul profilo `obs`:
 
-- cerca spans per servizio (`service.name`) oppure via trace ID dai log correlati.
-- esempio API per trace business:
-  `curl -sG 'http://localhost:3200/api/search' --data-urlencode 'tags=name=analyzer.handle_item' --data-urlencode 'limit=5'`
+- `prometheus`, `loki`, `tempo`, `grafana` locali restano disponibili come stack opzionale.
+- il forwarding principale del collector resta verso Grafana Cloud OTLP.
 
 ## File di configurazione
 

@@ -123,7 +123,7 @@ func TestConfiguredLiveModelRespectsRequestParametersAndReturnsValidJSON(t *test
 
 	requiredKeys := []string{
 		"job_category", "role", "company", "seniority", "location", "remote_type",
-		"tech_stack", "contract_type", "salary", "language", "summary_it", "confidence",
+		"tech_stack", "tags", "contract_type", "salary", "language", "summary_it", "confidence",
 	}
 	for _, key := range requiredKeys {
 		if _, ok := raw[key]; !ok {

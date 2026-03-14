@@ -24,7 +24,7 @@
 - Modalita` `thinking` configurabile (`LLM_THINKING_ENABLED`).
 - Anti-allucinazione nel prompt: uso solo dati espliciti presenti negli input.
 - Ranking qualita` annuncio basato sulla presenza chiara di campi chiave.
-- Scraping opzionale pagina sorgente (`ANALYZER_SCRAPE_SOURCE_PAGE`) con fallback al solo feed in caso di errore.
+- Source-enrichment configurabile (`ANALYZER_SOURCE_EXTRACTOR=off|basic|scrapling|hybrid`) con fallback al solo feed in caso di errore.
 - Quarantena item poison dopo soglia tentativi (`ANALYZER_MAX_DELIVERY_ATTEMPTS`).
 
 ### Backlog
@@ -72,7 +72,7 @@
 
 ### Attuali
 - `llm-mock` per test/dev senza modello reale.
-- `test-rss` per simulazione feed e validazione pipeline.
+- `test-rss` come mini-sito locale per validazione pipeline: feed RSS e pagine annuncio locali generate a intervallo.
 - Suite test unit/integration/e2e su queue semantics, requeue e pipeline.
 
 ### Backlog

@@ -40,6 +40,7 @@ type AnalyzedJob struct {
 	Location            string    `json:"location"`
 	RemoteType          string    `json:"remote_type"`
 	TechStack           []string  `json:"tech_stack"`
+	Tags                []string  `json:"tags,omitempty"`
 	ContractType        string    `json:"contract_type"`
 	Salary              string    `json:"salary"`
 	JobPostQualityScore int       `json:"job_post_quality_score"`

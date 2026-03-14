@@ -1,12 +1,28 @@
-💼 *{{md .Title}}* @ *{{md .Company}}*
-🏢 {{md .ContractType}}
-🌍 {{md .Location}} · {{md .RemoteType}}
-💰 {{md .Salary}}
+┏━━━━━━━━━━━━━━━━━━━━━━
+┃ 🚀 *{{ if .Role }}{{ md .Role }}{{ else }}{{ md .Title }}{{ end }}*
+┃ 🏢 {{ md .Company }}
+┃ 🏠 {{ md .Location }}
+┃ 💰 {{ md .Salary }}
+┗━━━━━━━━━━━━━━━━━━━━━━
 
-📝 {{md .SummaryIT}}
+{{- if .TechStack }}
 
-🔧 *Tech:* {{if .TechStack}}{{range $i, $v := .TechStack}}{{if $i}}, {{end}}{{md $v}}{{end}}{{else}}N/D{{end}}
-🌐 *Lingua:* {{md .Language}}
-⭐ *Qualità:* {{md .JobPostQualityRank}} ({{.JobPostQualityScore}}/100)
+🧩 *Stack:* {{- range $i, $v := .TechStack }}{{ if $i }}, {{ end }}#{{ md $v }}{{- end }}
+{{- end }}
 
-🔗 [Candidati qui]({{.SourceURL}})
+{{- if .SummaryIT }}
+
+📝 *Sintesi:*  
+{{ md .SummaryIT }}
+{{- end }}
+
+├ 📈 {{ md .Seniority }}
+├ 🏷 {{ md .ContractType }}
+├ 🌍 {{ md .Language }}
+└ ⭐ {{ .JobPostQualityRank }} ({{ .JobPostQualityScore }}/100)
+
+{{- if .Tags }}
+🏷 {{- range $i, $t := .Tags }}{{ if $i }} {{ end }}#{{ md $t }}{{- end }}
+{{- end }}
+
+🔗 [candidati]({{ .SourceURL }})

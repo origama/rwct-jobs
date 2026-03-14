@@ -6,8 +6,10 @@ Pipeline a microservizi Go: `RSS -> SQLite queue -> LLM analyzer -> dispatcher`.
 
 - `rss-reader`: poll feed RSS, deduplica item e pubblica payload raw in `analyzer_queue`.
 - `job-analyzer`: consuma `analyzer_queue`, analizza con LLM locale (llama.cpp), salva payload analizzato e accoda su `dispatch_queue`.
+- `scrapling-sidecar`: endpoint HTTP (`/extract`) per source-enrichment avanzato delle pagine remote quando `ANALYZER_SOURCE_EXTRACTOR` usa `scrapling`/`hybrid`.
 - `message-dispatcher`: consuma `dispatch_queue`, renderizza template markdown e invia a file o Telegram.
 - `web-admin`: UI per feed management, monitor code, runtime analyzer, requeue item e ispezione payload analizzati.
+- `test-rss`: mini-sito di test che espone feed RSS (`/feed.rss`) e pagine annuncio locali (`/jobs/...`) generate a intervallo configurabile.
 
 ## Stato e queue
 
@@ -39,9 +41,18 @@ docker compose --profile prod up --build
 ## Configurazione analyzer (chiavi principali)
 
 - `LLM_MODEL`, `LLM_ENDPOINT`, `LLM_TIMEOUT`, `LLM_MAX_TOKENS`
+- `LLM_TIMEOUT_MAX`: timeout massimo hard per richiesta LLM.
+- `LLM_TIMEOUT_PER_1K_CHARS`: budget extra per prompt lunghi (ogni ~1000 caratteri).
+- `LLM_TIMEOUT_PER_256_TOKENS`: budget extra per risposte lunghe (ogni 256 `max_tokens` richiesti).
 - `LLM_THINKING_ENABLED=true|false`: inoltra `enable_thinking` alla `/v1/chat/completions` quando supportato.
+- `ANALYZER_PROMPT_TEMPLATE`: prompt principale custom (Go `text/template`) con variabili `AllowedCategories`, `Title`, `URL`, `Description`, `SourcePageText`, `LinksCSV`, `ImagesCSV`.
+- `ANALYZER_COMPACT_PROMPT_TEMPLATE`: prompt fallback compatto custom con le stesse variabili.
 - `ANALYZER_MAX_PARALLEL_JOBS` (default `1`): massimo numero di job in parallelo per singolo processo `job-analyzer` (attualmente forzato a `1` in strict sequential mode).
-- `ANALYZER_SCRAPE_SOURCE_PAGE=true|false` (default `true`): fa fetch della pagina linkata nel job e aggiunge il testo estratto al prompt.
+- `ANALYZER_SOURCE_EXTRACTOR=off|basic|scrapling|hybrid` (default `basic`): strategia di source-enrichment della pagina linkata nel job.
+- `ANALYZER_SOURCE_MIN_CHARS_FOR_BASIC` (default `220`): soglia minima testo per attivare fallback in `hybrid`.
+- `ANALYZER_SCRAPLING_ENDPOINT` (default `http://scrapling-sidecar:8088`): endpoint sidecar Scrapling.
+- `ANALYZER_SCRAPLING_TIMEOUT` (default `8s`): timeout chiamata Scrapling.
+- `ANALYZER_SCRAPLING_MAX_CHARS` (default `10000`): clamp testo estratto da Scrapling.
 - `ANALYZER_MAX_DELIVERY_ATTEMPTS` (default `3`): soglia anti-poison item su `analyzer_queue`.
 - `LLM_PARALLEL_THREADS` (default `-1`): numero thread CPU per `llama.cpp` (`-t`, auto-detect quando `-1`).
 

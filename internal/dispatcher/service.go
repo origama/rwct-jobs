@@ -65,6 +65,8 @@ const defaultTpl = `*RWCT-JOBS*
 - Contratto: {{md .ContractType}}
 - Salary: {{md .Salary}}
 - Stack: {{range $i, $v := .TechStack}}{{if $i}}, {{end}}{{md $v}}{{end}}
+{{if .Tags}}- Tags: {{range $i, $t := .Tags}}{{if $i}} {{end}}#{{md $t}}{{end}}
+{{end}}
 
 {{if .OriginalLinks}}
 *Link Originali*

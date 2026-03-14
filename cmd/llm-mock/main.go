@@ -14,7 +14,7 @@ func main() {
 		resp := map[string]any{
 			"choices": []map[string]any{{
 				"message": map[string]string{
-					"content": `{"job_category":"Programmazione","role":"Software Engineer","company":"Unknown","seniority":"mid","location":"remote","remote_type":"remote","tech_stack":["go"],"contract_type":"","salary":"","language":"it","summary_it":"Annuncio processato dal mock LLM.","confidence":0.5}`,
+					"content": `{"job_category":"Programmazione","role":"Software Engineer","company":"Unknown","seniority":"mid","location":"remote","remote_type":"remote","tech_stack":["go"],"tags":["go","remote"],"contract_type":"","salary":"","language":"it","summary_it":"Annuncio processato dal mock LLM.","confidence":0.5}`,
 				},
 			}},
 		}

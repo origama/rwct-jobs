@@ -15,7 +15,10 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"text/template"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/time/rate"
 	_ "modernc.org/sqlite"
@@ -53,21 +56,37 @@ var normalizedJobCategories = map[string]string{
 }
 
 type Config struct {
-	DBPath              string
-	QueuePollInterval   time.Duration
-	LeaseDuration       time.Duration
-	LLMEndpoint         string
-	LLMModel            string
-	LLMTimeout          time.Duration
-	LLMMaxTokens        int
-	LLMThinking         bool
-	ScrapeSourcePage    bool
-	MaxConcurrency      int
-	MaxJobsPerMin       int
-	MaxDeliveryAttempts int
-	RetryAttempts       int
-	RetryBaseDelay      time.Duration
+	DBPath                 string
+	QueuePollInterval      time.Duration
+	LeaseDuration          time.Duration
+	LLMEndpoint            string
+	LLMModel               string
+	LLMTimeout             time.Duration
+	LLMTimeoutMax          time.Duration
+	LLMTimeoutPer1KChars   time.Duration
+	LLMTimeoutPer256Tokens time.Duration
+	LLMMaxTokens           int
+	LLMThinking            bool
+	PromptTemplate         string
+	CompactPromptTemplate  string
+	SourceExtractor        string
+	SourceMinChars         int
+	ScraplingEndpoint      string
+	ScraplingTimeout       time.Duration
+	ScraplingMaxChars      int
+	MaxConcurrency         int
+	MaxJobsPerMin          int
+	MaxDeliveryAttempts    int
+	RetryAttempts          int
+	RetryBaseDelay         time.Duration
 }
+
+const (
+	sourceExtractorOff       = "off"
+	sourceExtractorBasic     = "basic"
+	sourceExtractorScrapling = "scrapling"
+	sourceExtractorHybrid    = "hybrid"
+)
 
 var (
 	reScriptTags = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
@@ -106,6 +125,34 @@ func New(cfg Config) (*Service, error) {
 	if cfg.LeaseDuration <= 0 {
 		cfg.LeaseDuration = 2 * time.Minute
 	}
+	cfg.SourceExtractor = normalizeSourceExtractor(cfg.SourceExtractor)
+	if cfg.SourceMinChars < 1 {
+		cfg.SourceMinChars = 220
+	}
+	if strings.TrimSpace(cfg.ScraplingEndpoint) == "" {
+		cfg.ScraplingEndpoint = "http://scrapling-sidecar:8088"
+	}
+	if cfg.ScraplingTimeout <= 0 {
+		cfg.ScraplingTimeout = 8 * time.Second
+	}
+	if cfg.ScraplingMaxChars < 1 {
+		cfg.ScraplingMaxChars = 2500
+	}
+	if cfg.LLMTimeout <= 0 {
+		cfg.LLMTimeout = 20 * time.Second
+	}
+	if cfg.LLMTimeoutMax <= 0 {
+		cfg.LLMTimeoutMax = 10 * time.Minute
+	}
+	if cfg.LLMTimeoutMax < cfg.LLMTimeout {
+		cfg.LLMTimeoutMax = cfg.LLMTimeout
+	}
+	if cfg.LLMTimeoutPer1KChars <= 0 {
+		cfg.LLMTimeoutPer1KChars = 25 * time.Second
+	}
+	if cfg.LLMTimeoutPer256Tokens <= 0 {
+		cfg.LLMTimeoutPer256Tokens = 20 * time.Second
+	}
 	db, err := sql.Open("sqlite", sqliteDSN(cfg.DBPath))
 	if err != nil {
 		return nil, err
@@ -117,7 +164,7 @@ func New(cfg Config) (*Service, error) {
 	return &Service{
 		cfg:      cfg,
 		db:       db,
-		http:     &http.Client{Timeout: cfg.LLMTimeout},
+		http:     &http.Client{},
 		limiter:  rate.NewLimiter(rate.Every(time.Minute/time.Duration(cfg.MaxJobsPerMin)), 1),
 		workerID: fmt.Sprintf("%s-%d", safeHostname(), time.Now().UTC().UnixNano()),
 	}, nil
@@ -514,15 +561,19 @@ func (s *Service) publishError(itemID string, attempt int, code string, err erro
 
 func (s *Service) analyze(ctx context.Context, in events.RawJobItem) (events.AnalyzedJob, error) {
 	sourcePageText := ""
-	if s.cfg.ScrapeSourcePage {
-		if body, err := s.fetchSourcePageExcerpt(ctx, in.URL); err == nil {
-			sourcePageText = body
-		} else if strings.TrimSpace(in.URL) != "" {
-			slog.Warn("source page scraping failed; continuing with feed payload only", "item_id", in.ID, "url", in.URL, "err", err)
-		}
+	if body, err := s.fetchSourcePageExcerpt(ctx, in.URL); err == nil {
+		sourcePageText = body
+	} else if strings.TrimSpace(in.URL) != "" {
+		slog.Warn(
+			"source page scraping failed; continuing with feed payload only",
+			"item_id", in.ID,
+			"url", in.URL,
+			"strategy", s.cfg.SourceExtractor,
+			"err", err,
+		)
 	}
 
-	content, err := s.callLLM(ctx, buildPrompt(in, sourcePageText), s.cfg.LLMMaxTokens)
+	content, err := s.callLLM(ctx, s.buildPromptForLLM(in, sourcePageText), s.cfg.LLMMaxTokens)
 	if err != nil {
 		return events.AnalyzedJob{}, err
 	}
@@ -541,7 +592,7 @@ func (s *Service) analyze(ctx context.Context, in events.RawJobItem) (events.Ana
 			fallbackTokens = 1024
 		}
 		slog.Warn("llm returned truncated json, retrying compact mode", "item_id", in.ID, "max_tokens", fallbackTokens)
-		content2, err2 := s.callLLM(ctx, buildCompactPrompt(in, sourcePageText), fallbackTokens)
+		content2, err2 := s.callLLM(ctx, s.buildCompactPromptForLLM(in, sourcePageText), fallbackTokens)
 		if err2 != nil {
 			return events.AnalyzedJob{}, err2
 		}
@@ -559,18 +610,19 @@ func buildPrompt(in events.RawJobItem, sourcePageText string) string {
 	if len(description) > 1800 {
 		description = description[:1800]
 	}
-	sourcePageText = clampString(strings.TrimSpace(sourcePageText), 2500)
+	sourcePageText = strings.TrimSpace(sourcePageText)
 	if sourcePageText == "" {
 		sourcePageText = "N/D"
 	}
 	return fmt.Sprintf(`Analizza il seguente annuncio lavoro e restituisci SOLO JSON valido con i campi:
-job_category, role, company, seniority, location, remote_type, tech_stack (array), contract_type, salary, language, summary_it, confidence.
+job_category, role, company, seniority, location, remote_type, tech_stack (array), tags (array), contract_type, salary, language, summary_it, confidence.
 Lingua output: italiano.
 Regola anti-allucinazioni (obbligatoria): usa solo informazioni esplicitamente presenti in titolo/descrizione/link forniti.
 NON inferire da conoscenza esterna e NON inventare valori mancanti.
 Se un campo non è chiaramente presente usa stringa vuota (o array vuoto).
 Campi da valorizzare con massima priorita' (se presenti): seniority, location, contract_type, salary, tech_stack.
 Mantieni tech_stack breve: massimo 8 tecnologie reali, senza inventare valori.
+tags: array di 3-6 tag distintivi, minuscoli, senza #, max 24 caratteri per tag (es: go, kubernetes, remote, fintech, full-time).
 summary_it: una sola frase, massimo 220 caratteri.
 Per job_category usa SOLO una di queste categorie esatte:
 %s
@@ -594,18 +646,93 @@ func buildCompactPrompt(in events.RawJobItem, sourcePageText string) string {
 		sourcePageText = "N/D"
 	}
 	return fmt.Sprintf(`Restituisci SOLO 1 riga JSON valida (nessun markdown, nessun testo extra) con questi campi:
-job_category,role,company,seniority,location,remote_type,tech_stack,contract_type,salary,language,summary_it,confidence
+job_category,role,company,seniority,location,remote_type,tech_stack,tags,contract_type,salary,language,summary_it,confidence
 Vincoli:
 - job_category deve essere una di: %s
 - usa SOLO informazioni esplicitamente presenti nel testo fornito
 - non inventare: se non chiaro/menzionato usa stringa vuota o array vuoto
 - tech_stack massimo 8 elementi
+- tags: 3-6 valori lowercase, senza #, max 24 caratteri ciascuno
 - summary_it massimo 220 caratteri
 
 Titolo: %s
 URL: %s
 Descrizione: %s
 Contenuto pagina sorgente (estratto): %s`, strings.Join(allowedJobCategories, ", "), in.Title, in.URL, description, sourcePageText)
+}
+
+func (s *Service) sourceExcerptMaxChars() int {
+	if s.cfg.ScraplingMaxChars > 0 {
+		return s.cfg.ScraplingMaxChars
+	}
+	return 2500
+}
+
+type promptTemplateData struct {
+	AllowedCategories string
+	Title             string
+	URL               string
+	Description       string
+	SourcePageText    string
+	LinksCSV          string
+	ImagesCSV         string
+}
+
+func (s *Service) buildPromptForLLM(in events.RawJobItem, sourcePageText string) string {
+	if strings.TrimSpace(s.cfg.PromptTemplate) == "" {
+		return buildPrompt(in, sourcePageText)
+	}
+	rendered, err := renderPromptTemplate(s.cfg.PromptTemplate, in, sourcePageText, 1800, s.sourceExcerptMaxChars())
+	if err != nil {
+		slog.Warn("invalid analyzer prompt template; fallback to default", "err", err)
+		return buildPrompt(in, sourcePageText)
+	}
+	return rendered
+}
+
+func (s *Service) buildCompactPromptForLLM(in events.RawJobItem, sourcePageText string) string {
+	if strings.TrimSpace(s.cfg.CompactPromptTemplate) == "" {
+		return buildCompactPrompt(in, sourcePageText)
+	}
+	rendered, err := renderPromptTemplate(s.cfg.CompactPromptTemplate, in, sourcePageText, 1200, 1600)
+	if err != nil {
+		slog.Warn("invalid analyzer compact prompt template; fallback to default", "err", err)
+		return buildCompactPrompt(in, sourcePageText)
+	}
+	return rendered
+}
+
+func renderPromptTemplate(raw string, in events.RawJobItem, sourcePageText string, descMax, sourceMax int) (string, error) {
+	description := strings.TrimSpace(in.Description)
+	if len(description) > descMax {
+		description = description[:descMax]
+	}
+	sourcePageText = clampString(strings.TrimSpace(sourcePageText), sourceMax)
+	if sourcePageText == "" {
+		sourcePageText = "N/D"
+	}
+	data := promptTemplateData{
+		AllowedCategories: strings.Join(allowedJobCategories, ", "),
+		Title:             in.Title,
+		URL:               in.URL,
+		Description:       description,
+		SourcePageText:    sourcePageText,
+		LinksCSV:          strings.Join(in.Links, ", "),
+		ImagesCSV:         strings.Join(in.ImageURLs, ", "),
+	}
+	tpl, err := template.New("analyzer-prompt").Option("missingkey=error").Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	var out bytes.Buffer
+	if err := tpl.Execute(&out, data); err != nil {
+		return "", err
+	}
+	rendered := strings.TrimSpace(out.String())
+	if rendered == "" {
+		return "", errors.New("rendered prompt is empty")
+	}
+	return rendered, nil
 }
 
 func stripMarkdownCodeFence(v string) string {
@@ -617,6 +744,10 @@ func stripMarkdownCodeFence(v string) string {
 }
 
 func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (string, error) {
+	timeout := s.computeLLMTimeout(prompt, maxTokens)
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	reqBody := map[string]any{
 		"model": s.cfg.LLMModel,
 		"messages": []map[string]string{
@@ -631,7 +762,7 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 	}
 	body, _ := json.Marshal(reqBody)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.cfg.LLMEndpoint, "/")+"/v1/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(s.cfg.LLMEndpoint, "/")+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -662,6 +793,46 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 	return stripMarkdownCodeFence(strings.TrimSpace(r.Choices[0].Message.Content)), nil
 }
 
+func (s *Service) computeLLMTimeout(prompt string, maxTokens int) time.Duration {
+	base := s.cfg.LLMTimeout
+	if base <= 0 {
+		base = 20 * time.Second
+	}
+	maxTimeout := s.cfg.LLMTimeoutMax
+	if maxTimeout <= 0 {
+		maxTimeout = 10 * time.Minute
+	}
+	if maxTimeout < base {
+		maxTimeout = base
+	}
+	per1k := s.cfg.LLMTimeoutPer1KChars
+	if per1k <= 0 {
+		per1k = 25 * time.Second
+	}
+	per256 := s.cfg.LLMTimeoutPer256Tokens
+	if per256 <= 0 {
+		per256 = 20 * time.Second
+	}
+
+	timeout := base
+	chars := len(strings.TrimSpace(prompt))
+	if chars > 0 {
+		steps := (chars + 999) / 1000
+		timeout += time.Duration(steps) * per1k
+	}
+	if maxTokens > 0 {
+		steps := (maxTokens + 255) / 256
+		timeout += time.Duration(steps) * per256
+	}
+	if timeout > maxTimeout {
+		timeout = maxTimeout
+	}
+	if timeout < base {
+		return base
+	}
+	return timeout
+}
+
 func parseAnalyzedJob(content string, in events.RawJobItem) (events.AnalyzedJob, error) {
 	var out events.AnalyzedJob
 	if err := json.Unmarshal([]byte(content), &out); err != nil {
@@ -685,6 +856,8 @@ func parseAnalyzedJob(content string, in events.RawJobItem) (events.AnalyzedJob,
 	out.Salary = sanitizeUnknown(out.Salary)
 	out.TechStack = trimList(out.TechStack, 8)
 	out.TechStack = sanitizeTechStack(out.TechStack)
+	out.Tags = trimList(out.Tags, 6)
+	out.Tags = sanitizeTags(out.Tags)
 	out.JobPostQualityScore, out.JobPostQualityRank, out.JobPostMissing = computeJobPostQuality(out)
 	if out.Language == "" {
 		out.Language = "it"
@@ -752,6 +925,57 @@ func normalizeJobCategory(v string) string {
 }
 
 func (s *Service) fetchSourcePageExcerpt(ctx context.Context, rawURL string) (string, error) {
+	switch normalizeSourceExtractor(s.cfg.SourceExtractor) {
+	case sourceExtractorOff:
+		return "", nil
+	case sourceExtractorBasic:
+		return s.fetchSourcePageExcerptBasic(ctx, rawURL)
+	case sourceExtractorScrapling:
+		return s.fetchSourcePageExcerptScrapling(ctx, rawURL)
+	case sourceExtractorHybrid:
+		return s.fetchSourcePageExcerptHybrid(ctx, rawURL)
+	default:
+		return s.fetchSourcePageExcerptBasic(ctx, rawURL)
+	}
+}
+
+func normalizeSourceExtractor(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", sourceExtractorBasic:
+		return sourceExtractorBasic
+	case sourceExtractorOff:
+		return sourceExtractorOff
+	case sourceExtractorScrapling:
+		return sourceExtractorScrapling
+	case sourceExtractorHybrid:
+		return sourceExtractorHybrid
+	default:
+		return sourceExtractorBasic
+	}
+}
+
+func (s *Service) fetchSourcePageExcerptHybrid(ctx context.Context, rawURL string) (string, error) {
+	basicText, basicErr := s.fetchSourcePageExcerptBasic(ctx, rawURL)
+	if basicErr == nil && utf8.RuneCountInString(strings.TrimSpace(basicText)) >= s.cfg.SourceMinChars {
+		return basicText, nil
+	}
+
+	scraplingText, scraplingErr := s.fetchSourcePageExcerptScrapling(ctx, rawURL)
+	if scraplingErr == nil {
+		return scraplingText, nil
+	}
+
+	if basicErr == nil {
+		// Keep best-effort basic text if fallback fails after short extraction.
+		if strings.TrimSpace(basicText) != "" {
+			return basicText, nil
+		}
+		return "", scraplingErr
+	}
+	return "", fmt.Errorf("basic failed: %w; scrapling failed: %v", basicErr, scraplingErr)
+}
+
+func (s *Service) fetchSourcePageExcerptBasic(ctx context.Context, rawURL string) (string, error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return "", nil
@@ -789,7 +1013,98 @@ func (s *Service) fetchSourcePageExcerpt(ctx context.Context, rawURL string) (st
 		return "", err
 	}
 	txt := extractTextFromHTML(string(b))
-	txt = clampString(txt, 2500)
+	txt = clampString(txt, s.sourceExcerptMaxChars())
+	return txt, nil
+}
+
+type scraplingExtractRequest struct {
+	URL       string `json:"url"`
+	TimeoutMS int    `json:"timeout_ms"`
+	MaxChars  int    `json:"max_chars"`
+	Mode      string `json:"mode"`
+	UserAgent string `json:"user_agent"`
+}
+
+type scraplingExtractResponse struct {
+	OK         bool   `json:"ok"`
+	Text       string `json:"text"`
+	FinalURL   string `json:"final_url"`
+	Method     string `json:"method"`
+	StatusCode int    `json:"status_code"`
+	DurationMS int    `json:"duration_ms"`
+	Blocked    bool   `json:"blocked"`
+	Error      string `json:"error"`
+}
+
+func (s *Service) fetchSourcePageExcerptScrapling(ctx context.Context, rawURL string) (string, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "", nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u == nil {
+		return "", fmt.Errorf("invalid source url")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("unsupported source url scheme: %s", u.Scheme)
+	}
+
+	endpoint := strings.TrimRight(strings.TrimSpace(s.cfg.ScraplingEndpoint), "/")
+	if endpoint == "" {
+		return "", errors.New("missing scrapling endpoint")
+	}
+
+	timeout := s.cfg.ScraplingTimeout
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	reqBody := scraplingExtractRequest{
+		URL:       rawURL,
+		TimeoutMS: int(timeout.Milliseconds()),
+		MaxChars:  s.cfg.ScraplingMaxChars,
+		Mode:      "auto",
+		UserAgent: "rwct-agent-analyzer/1.0 (+source-page-scraper)",
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint+"/extract", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("scrapling status: %d", resp.StatusCode)
+	}
+
+	var out scraplingExtractResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if !out.OK {
+		msg := strings.TrimSpace(out.Error)
+		if msg == "" {
+			msg = "extract failed"
+		}
+		return "", fmt.Errorf("scrapling extract failed: %s", msg)
+	}
+
+	txt := clampString(strings.TrimSpace(out.Text), s.cfg.ScraplingMaxChars)
+	if txt == "" {
+		return "", errors.New("scrapling returned empty text")
+	}
 	return txt, nil
 }
 
@@ -920,6 +1235,61 @@ func sanitizeTechStack(values []string) []string {
 		out = append(out, clean)
 	}
 	return out
+}
+
+func sanitizeTags(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, v := range values {
+		tag := normalizeTag(v)
+		if tag == "" {
+			continue
+		}
+		if len(tag) > 24 {
+			tag = tag[:24]
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	return out
+}
+
+func normalizeTag(v string) string {
+	v = strings.TrimSpace(strings.TrimPrefix(v, "#"))
+	if v == "" {
+		return ""
+	}
+	mapped := strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r):
+			return unicode.ToLower(r)
+		case r == ' ' || r == '-' || r == '_':
+			return '-'
+		default:
+			return -1
+		}
+	}, v)
+	if mapped == "" {
+		return ""
+	}
+	var b strings.Builder
+	prevDash := false
+	for _, r := range mapped {
+		if r == '-' {
+			if prevDash {
+				continue
+			}
+			prevDash = true
+			b.WriteRune(r)
+			continue
+		}
+		prevDash = false
+		b.WriteRune(r)
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func computeJobPostQuality(out events.AnalyzedJob) (score int, rank string, missing []string) {

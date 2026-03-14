@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1.7
+FROM python:3.12-slim
+
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+RUN pip install --no-cache-dir \
+    flask \
+    gunicorn \
+    beautifulsoup4 \
+    lxml \
+    markdownify \
+    "scrapling[fetchers]"
+
+COPY sidecars/scrapling_sidecar/app.py /app/app.py
+
+EXPOSE 8088
+
+CMD ["gunicorn", "--bind", "0.0.0.0:8088", "--workers", "1", "--threads", "4", "--timeout", "30", "app:app"]

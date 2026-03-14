@@ -34,8 +34,8 @@ func getenvInt(k string, def int) int {
 }
 
 func main() {
-	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
-	slog.SetDefault(slog.New(h))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	cfg := dispatcher.Config{
 		DBPath:                 getenv("ITEM_DB_PATH", getenv("RSS_DB_PATH", "/data/rss-reader.db")),
@@ -56,16 +56,20 @@ func main() {
 		TelegramAPIBaseURL:     getenv("TELEGRAM_API_BASE_URL", "https://api.telegram.org"),
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	if endpoint := getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""); endpoint != "" {
-		shutdown, err := telemetry.InitMetrics(ctx, endpoint)
-		if err != nil {
-			slog.Error("otel metrics init failed", "err", err)
-		} else {
-			defer func() { _ = shutdown(context.Background()) }()
-		}
+	logger, shutdownTelemetry, err := telemetry.Bootstrap(ctx, telemetry.BootstrapConfig{
+		Endpoint:       getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		ServiceName:    "message-dispatcher",
+		ServiceVersion: getenv("SERVICE_VERSION", "dev"),
+		Environment:    getenv("DEPLOY_ENV", "local"),
+		Level:          slog.LevelInfo,
+		Insecure:       dispatcher.MustEnvBool("OTEL_EXPORTER_OTLP_INSECURE", true),
+	})
+	slog.SetDefault(logger)
+	if err != nil {
+		slog.Error("otel init failed", "err", err)
 	}
+	defer func() { _ = shutdownTelemetry(context.Background()) }()
+
 	_ = health.StartServer(getenvInt("HEALTH_PORT", 8083))
 
 	svc, err := dispatcher.New(cfg)

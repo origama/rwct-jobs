@@ -14,6 +14,8 @@ const (
 type RawJobItem struct {
 	SchemaVersion string    `json:"schema_version"`
 	ID            string    `json:"id"`
+	TraceParent   string    `json:"traceparent,omitempty"`
+	TraceState    string    `json:"tracestate,omitempty"`
 	FeedURL       string    `json:"feed_url"`
 	SourceLabel   string    `json:"source_label,omitempty"`
 	GUID          string    `json:"guid,omitempty"`
@@ -29,6 +31,8 @@ type RawJobItem struct {
 type AnalyzedJob struct {
 	SchemaVersion       string    `json:"schema_version"`
 	ID                  string    `json:"id"`
+	TraceParent         string    `json:"traceparent,omitempty"`
+	TraceState          string    `json:"tracestate,omitempty"`
 	GUID                string    `json:"guid,omitempty"`
 	SourceURL           string    `json:"source_url"`
 	SourceLabel         string    `json:"source_label,omitempty"`

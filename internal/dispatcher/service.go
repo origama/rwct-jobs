@@ -15,11 +15,16 @@ import (
 	"text/template"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 	_ "modernc.org/sqlite"
 
 	"rwct-agent/pkg/events"
 	"rwct-agent/pkg/retry"
+	"rwct-agent/pkg/telemetry"
 )
 
 type Config struct {
@@ -49,6 +54,12 @@ type Service struct {
 	tplTG    *template.Template
 	http     *http.Client
 	workerID string
+
+	tracer trace.Tracer
+
+	dispatchDurationSec otelmetric.Float64Histogram
+	dispatchProcessed   otelmetric.Int64Counter
+	dispatchFailed      otelmetric.Int64Counter
 }
 
 const defaultTpl = `*RWCT-JOBS*
@@ -132,14 +143,63 @@ func New(cfg Config) (*Service, error) {
 		}
 	}
 	return &Service{
-		cfg:      cfg,
-		db:       db,
-		limiter:  rate.NewLimiter(rate.Every(time.Minute/time.Duration(cfg.RateLimitPerMin)), 1),
-		tpl:      tpl,
-		tplTG:    tplTG,
-		http:     &http.Client{Timeout: 20 * time.Second},
+		cfg:     cfg,
+		db:      db,
+		limiter: rate.NewLimiter(rate.Every(time.Minute/time.Duration(cfg.RateLimitPerMin)), 1),
+		tpl:     tpl,
+		tplTG:   tplTG,
+		http: &http.Client{
+			Timeout:   20 * time.Second,
+			Transport: telemetry.NewHTTPTransport(http.DefaultTransport),
+		},
 		workerID: fmt.Sprintf("dispatcher-%d", time.Now().UTC().UnixNano()),
+		tracer:   otel.Tracer("rwct-agent/message-dispatcher"),
+		dispatchDurationSec: mustDispatchFloat64Histogram("rwct_dispatch_duration_seconds",
+			"Duration of dispatch jobs"),
+		dispatchProcessed: mustDispatchInt64Counter("rwct_dispatch_jobs_total",
+			"Number of dispatch jobs processed"),
+		dispatchFailed: mustDispatchInt64Counter("rwct_dispatch_job_failures_total",
+			"Number of dispatch jobs failed"),
 	}, nil
+}
+
+func dispatchMeter() otelmetric.Meter {
+	return otel.Meter("rwct-agent/message-dispatcher")
+}
+
+func mustDispatchFloat64Histogram(name, description string) otelmetric.Float64Histogram {
+	h, _ := dispatchMeter().Float64Histogram(name, otelmetric.WithDescription(description))
+	return h
+}
+
+func mustDispatchInt64Counter(name, description string) otelmetric.Int64Counter {
+	c, _ := dispatchMeter().Int64Counter(name, otelmetric.WithDescription(description))
+	return c
+}
+
+func (s *Service) tracerForUse() trace.Tracer {
+	if s.tracer != nil {
+		return s.tracer
+	}
+	return otel.Tracer("rwct-agent/message-dispatcher")
+}
+
+func (s *Service) recordDispatchDuration(ctx context.Context, seconds float64, opts ...otelmetric.RecordOption) {
+	if s.dispatchDurationSec != nil {
+		s.dispatchDurationSec.Record(ctx, seconds, opts...)
+	}
+}
+
+func (s *Service) addDispatchProcessed(ctx context.Context, opts ...otelmetric.AddOption) {
+	if s.dispatchProcessed != nil {
+		s.dispatchProcessed.Add(ctx, 1, opts...)
+	}
+}
+
+func (s *Service) addDispatchFailed(ctx context.Context, opts ...otelmetric.AddOption) {
+	if s.dispatchFailed != nil {
+		s.dispatchFailed.Add(ctx, 1, opts...)
+	}
 }
 
 func sqliteDSN(path string) string {
@@ -273,20 +333,34 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) handleClaimedMessage(ctx context.Context, itemID string, payload []byte) error {
+	started := time.Now()
 	var in events.AnalyzedJob
 	if err := json.Unmarshal(payload, &in); err != nil {
 		_ = s.releaseDispatchClaim(itemID, fmt.Sprintf("invalid_dispatch_payload: %v", err))
+		s.addDispatchFailed(ctx, otelmetric.WithAttributes(attribute.String("reason", "invalid_dispatch_payload")))
 		return err
 	}
 	if strings.TrimSpace(in.ID) == "" {
 		in.ID = itemID
 	}
+	ctx = telemetry.ExtractTraceContext(ctx, in.TraceParent, in.TraceState)
+	ctx, span := s.tracerForUse().Start(ctx, "dispatcher.handle_item",
+		trace.WithAttributes(
+			attribute.String("item.id", in.ID),
+			attribute.String("destination.mode", strings.ToLower(strings.TrimSpace(s.cfg.DestinationMode))),
+		))
+	defer span.End()
+	defer s.recordDispatchDuration(ctx, time.Since(started).Seconds())
+
 	alreadyDispatched, err := s.isAlreadyDispatched(in.ID)
 	if err != nil {
+		span.RecordError(err)
+		s.addDispatchFailed(ctx, otelmetric.WithAttributes(attribute.String("reason", "already_dispatched_check_failed")))
 		return err
 	}
 	if alreadyDispatched {
 		slog.Info("skip duplicate analyzed item already dispatched", "item_id", in.ID)
+		s.addDispatchProcessed(ctx, otelmetric.WithAttributes(attribute.String("status", "duplicate")))
 		return s.completeDispatchClaim(itemID)
 	}
 	tpl := s.tpl
@@ -296,25 +370,32 @@ func (s *Service) handleClaimedMessage(ctx context.Context, itemID string, paylo
 	var msg bytes.Buffer
 	if err := tpl.Execute(&msg, in); err != nil {
 		_ = s.releaseDispatchClaim(itemID, fmt.Sprintf("template_execute_failed: %v", err))
+		span.RecordError(err)
+		s.addDispatchFailed(ctx, otelmetric.WithAttributes(attribute.String("reason", "template_execute_failed")))
 		return err
 	}
 
 	err = retry.Exponential(ctx, s.cfg.RetryAttempts, s.cfg.RetryBaseDelay, func(attempt int) error {
-		err := s.deliver(msg.String())
+		err := s.deliver(ctx, msg.String())
 		if err != nil {
 			_ = s.markItemStatus(in.ID, events.ItemStatusFailed, err.Error())
 			s.publishError(in.ID, attempt, "dispatch_failed", err)
+			span.RecordError(err)
 		}
 		return err
 	})
 	if err != nil {
 		_ = s.releaseDispatchClaim(itemID, fmt.Sprintf("deliver_failed: %v", err))
+		s.addDispatchFailed(ctx, otelmetric.WithAttributes(attribute.String("reason", "deliver_failed")))
 		return err
 	}
 	_ = s.markItemStatus(in.ID, events.ItemStatusDispatched, "")
 	if err := s.completeDispatchClaim(itemID); err != nil {
+		span.RecordError(err)
+		s.addDispatchFailed(ctx, otelmetric.WithAttributes(attribute.String("reason", "complete_claim_failed")))
 		return err
 	}
+	s.addDispatchProcessed(ctx, otelmetric.WithAttributes(attribute.String("status", "success")))
 	slog.Info("dispatch completed", "item_id", in.ID, "destination", strings.ToLower(s.cfg.DestinationMode))
 	return nil
 }
@@ -416,12 +497,12 @@ func (s *Service) markItemStatus(itemID, status, lastError string) error {
 	return err
 }
 
-func (s *Service) deliver(message string) error {
+func (s *Service) deliver(ctx context.Context, message string) error {
 	switch strings.ToLower(s.cfg.DestinationMode) {
 	case "file", "":
 		return s.deliverFile(message)
 	case "telegram":
-		return s.deliverTelegram(message)
+		return s.deliverTelegram(ctx, message)
 	default:
 		return fmt.Errorf("unsupported destination mode: %s", s.cfg.DestinationMode)
 	}
@@ -443,7 +524,7 @@ func (s *Service) deliverFile(message string) error {
 	return err
 }
 
-func (s *Service) deliverTelegram(message string) error {
+func (s *Service) deliverTelegram(ctx context.Context, message string) error {
 	if s.cfg.TelegramBotToken == "" {
 		return fmt.Errorf("telegram bot token missing")
 	}
@@ -451,19 +532,19 @@ func (s *Service) deliverTelegram(message string) error {
 		return fmt.Errorf("telegram chat id missing")
 	}
 
-	err := s.deliverTelegramWithParseMode(message, s.cfg.TelegramParseMode)
+	err := s.deliverTelegramWithParseMode(ctx, message, s.cfg.TelegramParseMode)
 	if err == nil {
 		return nil
 	}
 	// Fallback when formatting breaks Telegram entity parsing.
 	if strings.TrimSpace(s.cfg.TelegramParseMode) != "" && strings.Contains(strings.ToLower(err.Error()), "can't parse entities") {
 		slog.Warn("telegram parse failed, retrying without parse_mode")
-		return s.deliverTelegramWithParseMode(message, "")
+		return s.deliverTelegramWithParseMode(ctx, message, "")
 	}
 	return err
 }
 
-func (s *Service) deliverTelegramWithParseMode(message, parseMode string) error {
+func (s *Service) deliverTelegramWithParseMode(ctx context.Context, message, parseMode string) error {
 	baseURL := strings.TrimRight(s.cfg.TelegramAPIBaseURL, "/")
 	if baseURL == "" {
 		baseURL = "https://api.telegram.org"
@@ -483,7 +564,7 @@ func (s *Service) deliverTelegramWithParseMode(message, parseMode string) error 
 	}
 
 	body, _ := json.Marshal(reqBody)
-	req, err := http.NewRequest(http.MethodPost, apiURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

@@ -82,7 +82,9 @@
 
 ### Attuali
 - Bus e stato persistente su SQLite condiviso tra servizi.
-- Healthcheck e telemetria OpenTelemetry.
+- Healthcheck e telemetria OpenTelemetry end-to-end (metriche, log, tracce) via `otel-collector`.
+- Stack osservabilita` locale completo: `prometheus`, `loki`, `tempo`, `grafana` con datasource/dashboard provisionati.
+- Propagazione trace context distribuito nella pipeline asincrona (`traceparent`/`tracestate` nei payload evento).
 - Avvio con Docker Compose (`dev`/`prod`).
 - Documentazione state machine/lifecycle e troubleshooting operativo.
 

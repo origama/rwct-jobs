@@ -40,8 +40,10 @@ docker compose --profile prod up --build
 
 - `LLM_MODEL`, `LLM_ENDPOINT`, `LLM_TIMEOUT`, `LLM_MAX_TOKENS`
 - `LLM_THINKING_ENABLED=true|false`: inoltra `enable_thinking` alla `/v1/chat/completions` quando supportato.
+- `ANALYZER_MAX_PARALLEL_JOBS` (default `1`): massimo numero di job in parallelo per singolo processo `job-analyzer` (attualmente forzato a `1` in strict sequential mode).
 - `ANALYZER_SCRAPE_SOURCE_PAGE=true|false` (default `true`): fa fetch della pagina linkata nel job e aggiunge il testo estratto al prompt.
 - `ANALYZER_MAX_DELIVERY_ATTEMPTS` (default `3`): soglia anti-poison item su `analyzer_queue`.
+- `LLM_PARALLEL_THREADS` (default `-1`): numero thread CPU per `llama.cpp` (`-t`, auto-detect quando `-1`).
 
 ## Telegram
 

@@ -33,6 +33,13 @@ func getenvInt(k string, def int) int {
 	return n
 }
 
+func getenvIntAlias(primary, legacy string, def int) int {
+	if v := getenvInt(primary, def); v != def || os.Getenv(primary) != "" {
+		return v
+	}
+	return getenvInt(legacy, def)
+}
+
 func getenvBool(k string, def bool) bool {
 	v := os.Getenv(k)
 	if v == "" {
@@ -62,7 +69,7 @@ func main() {
 		LLMMaxTokens:        getenvInt("LLM_MAX_TOKENS", 512),
 		LLMThinking:         getenvBool("LLM_THINKING_ENABLED", false),
 		ScrapeSourcePage:    getenvBool("ANALYZER_SCRAPE_SOURCE_PAGE", true),
-		MaxConcurrency:      getenvInt("LLM_MAX_CONCURRENCY", 1),
+		MaxConcurrency:      getenvIntAlias("ANALYZER_MAX_PARALLEL_JOBS", "LLM_MAX_CONCURRENCY", 1),
 		MaxJobsPerMin:       getenvInt("LLM_MAX_JOBS_PER_MIN", 20),
 		MaxDeliveryAttempts: getenvInt("ANALYZER_MAX_DELIVERY_ATTEMPTS", 3),
 		RetryAttempts:       getenvInt("DLQ_RETRY_ATTEMPTS", 3),

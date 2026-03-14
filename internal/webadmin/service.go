@@ -971,7 +971,7 @@ ORDER BY updated_at DESC
 			Timeout:           getenv("LLM_TIMEOUT", "20s"),
 			MaxTokens:         getenvInt("LLM_MAX_TOKENS", 512),
 			ThinkingEnabled:   getenvBool("LLM_THINKING_ENABLED", false),
-			MaxConcurrency:    getenvInt("LLM_MAX_CONCURRENCY", 1),
+			MaxConcurrency:    getenvIntAlias("ANALYZER_MAX_PARALLEL_JOBS", "LLM_MAX_CONCURRENCY", 1),
 			MaxJobsPerMin:     getenvInt("LLM_MAX_JOBS_PER_MIN", 20),
 			QueuePollInterval: getenv("ANALYZER_QUEUE_POLL_INTERVAL", "1200ms"),
 			LeaseDuration:     getenv("ANALYZER_QUEUE_LEASE_DURATION", "2m"),
@@ -1161,6 +1161,13 @@ func getenvInt(k string, def int) int {
 		return def
 	}
 	return n
+}
+
+func getenvIntAlias(primary, legacy string, def int) int {
+	if v := getenvInt(primary, def); v != def || strings.TrimSpace(os.Getenv(primary)) != "" {
+		return v
+	}
+	return getenvInt(legacy, def)
 }
 
 func getenvBool(k string, def bool) bool {

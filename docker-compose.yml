@@ -34,7 +34,7 @@ services:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: rwct-llama-cpp
     profiles: ["standalone-llama"]
-    command: ["-m", "/models/${LLM_MODEL_FILE}", "--host", "0.0.0.0", "--port", "8080", "-c", "2048", "-ngl", "0", "-t", "4"]
+    command: ["-m", "/models/${LLM_MODEL_FILE}", "--host", "0.0.0.0", "--port", "8080", "-c", "2048", "-ngl", "0", "-t", "${LLM_PARALLEL_THREADS:--1}"]
     volumes:
       - ${LLM_MODELS_DIR:-./models}:/models:ro
     healthcheck:
@@ -84,7 +84,7 @@ services:
       LLAMA_PORT: 8080
       LLAMA_CTX: 4096
       LLAMA_NGL: 0
-      LLAMA_THREADS: 4
+      LLM_PARALLEL_THREADS: ${LLM_PARALLEL_THREADS:--1}
     volumes:
       - rwct-data:/data
       - ./configs:/app/configs:ro

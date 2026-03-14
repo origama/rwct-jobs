@@ -15,7 +15,7 @@ func TestHandleAnalyzerRuntimeReturnsConfiguredFields(t *testing.T) {
 	t.Setenv("LLM_TIMEOUT", "90s")
 	t.Setenv("LLM_MAX_TOKENS", "1024")
 	t.Setenv("LLM_THINKING_ENABLED", "true")
-	t.Setenv("LLM_MAX_CONCURRENCY", "4")
+	t.Setenv("ANALYZER_MAX_PARALLEL_JOBS", "4")
 	t.Setenv("LLM_MAX_JOBS_PER_MIN", "60")
 	t.Setenv("ANALYZER_QUEUE_POLL_INTERVAL", "1500ms")
 	t.Setenv("ANALYZER_QUEUE_LEASE_DURATION", "3m")

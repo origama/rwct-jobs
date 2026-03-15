@@ -94,6 +94,7 @@ Forwarding Grafana Cloud (collector):
 - credenziali in `.env.secrets`:
   - `GRAFANA_INSTANCE_ID`
   - `GRAFANA_TOKEN`
+- metriche host abilitate via receiver `hostmetrics` (CPU, memoria, disco/filesystem, rete, paging, process count).
 
 Dashboard provisionata automaticamente:
 - `RWCT Observability Overview` (Grafana folder `RWCT`)

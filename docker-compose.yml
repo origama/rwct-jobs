@@ -12,6 +12,7 @@ services:
     env_file:
       - .env.secrets
     volumes:
+      - /:/hostfs:ro
       - ./observability/collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
       - "4317:4317"

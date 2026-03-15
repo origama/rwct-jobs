@@ -5,6 +5,18 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
+  hostmetrics:
+    collection_interval: 15s
+    root_path: /hostfs
+    scrapers:
+      cpu:
+      memory:
+      load:
+      filesystem:
+      disk:
+      network:
+      paging:
+      processes:
 
 processors:
   memory_limiter:
@@ -38,7 +50,7 @@ service:
   extensions: [health_check, basicauth/grafana_cloud]
   pipelines:
     metrics:
-      receivers: [otlp]
+      receivers: [otlp, hostmetrics]
       processors: [memory_limiter, batch]
       exporters: [prometheus, otlp_http/grafana_cloud]
     logs:

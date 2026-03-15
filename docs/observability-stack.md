@@ -7,6 +7,7 @@ Tutti i componenti applicativi inviano segnali OpenTelemetry all'istanza locale 
 - Metriche: OTel SDK -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
 - Log: OTel SDK/bridge slog -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
 - Tracce: OTel SDK -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
+- Metriche host: receiver `hostmetrics` nel collector (CPU, memoria, disco/filesystem, rete, paging, process count)
 
 L'endpoint di destinazione e`:
 `https://otlp-gateway-prod-eu-west-0.grafana.net/otlp`
@@ -61,6 +62,7 @@ Collector:
 Tracce/log/metriche:
 
 - verifica su Grafana Cloud (Explore/Traces/Metrics/Logs).
+- metriche host utili da cercare: `system.cpu.*`, `system.memory.*`, `system.filesystem.*`, `system.network.*`, `system.paging.*`, `system.processes.*`
 
 Nota sul profilo `obs`:
 

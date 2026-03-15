@@ -96,6 +96,11 @@ Forwarding Grafana Cloud (collector):
   - `GRAFANA_TOKEN`
 - metriche host abilitate via receiver `hostmetrics` (CPU, memoria, disco/filesystem, rete, paging, process count).
 
+Metriche pipeline FSM esportate (via OTel Collector):
+- `rwct_pipeline_queue_items{queue,pipeline_stage,state}`: elementi nelle code SQLite (`analyzer_queue`/`dispatch_queue`) per stato (`QUEUED`,`LEASED`,`DONE`).
+- `rwct_pipeline_items_by_status{status}`: elementi `rss_items` per stato business (`NEW`,`ANALYZED`,`DISPATCHED`,`FAILED`).
+- `rwct_pipeline_items_by_queue_state{queue_state}`: stato derivato usato nel monitor (`not_enqueued_raw`,`queued_raw`,`inflight_raw`,`processed_raw`,`not_enqueued_analyzed`,`queued_analyzed`,`dispatched`,`failed`,`unknown`).
+
 Dashboard provisionata automaticamente:
 - `RWCT Observability Overview` (Grafana folder `RWCT`)
 - file: `observability/grafana/dashboards/rwct-overview.json`

@@ -14,6 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	_ "modernc.org/sqlite"
 
 	"rwct-agent/pkg/events"
@@ -30,6 +33,11 @@ type Service struct {
 	cfg  Config
 	db   *sql.DB
 	http *http.Server
+
+	metricsReg           otelmetric.Registration
+	queueItemsGauge      otelmetric.Int64ObservableGauge
+	itemStatusGauge      otelmetric.Int64ObservableGauge
+	itemQueueStateGauge  otelmetric.Int64ObservableGauge
 }
 
 type feedRow struct {
@@ -94,6 +102,28 @@ type analyzerRuntimeRow struct {
 
 var unsafeNameRe = regexp.MustCompile(`[^a-z0-9]+`)
 
+var (
+	rawQueueStates      = []string{"QUEUED", "LEASED", "DONE"}
+	analyzedQueueStates = []string{"QUEUED", "LEASED", "DONE"}
+	itemStatuses        = []string{
+		events.ItemStatusNew,
+		events.ItemStatusAnalyzed,
+		events.ItemStatusDispatched,
+		events.ItemStatusFailed,
+	}
+	itemQueueStates = []string{
+		"not_enqueued_raw",
+		"queued_raw",
+		"inflight_raw",
+		"processed_raw",
+		"not_enqueued_analyzed",
+		"queued_analyzed",
+		"dispatched",
+		"failed",
+		"unknown",
+	}
+)
+
 func New(cfg Config) (*Service, error) {
 	if cfg.HTTPPort <= 0 {
 		cfg.HTTPPort = 8090
@@ -106,7 +136,9 @@ func New(cfg Config) (*Service, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &Service{cfg: cfg, db: db}, nil
+	s := &Service{cfg: cfg, db: db}
+	s.initMetrics()
+	return s, nil
 }
 
 func sqliteDSN(path string) string {
@@ -116,7 +148,173 @@ func sqliteDSN(path string) string {
 	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 }
 
-func (s *Service) Close() error { return s.db.Close() }
+func (s *Service) Close() error {
+	if s.metricsReg != nil {
+		_ = s.metricsReg.Unregister()
+	}
+	return s.db.Close()
+}
+
+func (s *Service) initMetrics() {
+	meter := otel.Meter("rwct-agent/web-admin")
+	s.queueItemsGauge, _ = meter.Int64ObservableGauge(
+		"rwct_pipeline_queue_items",
+		otelmetric.WithDescription("Current number of items in each queue state"),
+	)
+	s.itemStatusGauge, _ = meter.Int64ObservableGauge(
+		"rwct_pipeline_items_by_status",
+		otelmetric.WithDescription("Current number of items by business status"),
+	)
+	s.itemQueueStateGauge, _ = meter.Int64ObservableGauge(
+		"rwct_pipeline_items_by_queue_state",
+		otelmetric.WithDescription("Current number of items by derived queue state from FSM"),
+	)
+	reg, err := meter.RegisterCallback(s.observePipelineMetrics,
+		s.queueItemsGauge,
+		s.itemStatusGauge,
+		s.itemQueueStateGauge,
+	)
+	if err != nil {
+		slog.Warn("web-admin metrics callback registration failed", "err", err)
+		return
+	}
+	s.metricsReg = reg
+}
+
+func (s *Service) observePipelineMetrics(ctx context.Context, observer otelmetric.Observer) error {
+	// Queue FSM: analyzer_queue and dispatch_queue each expose QUEUED/LEASED/DONE.
+	rawCounts := s.countQueueStates("analyzer_queue", rawQueueStates)
+	for _, st := range rawQueueStates {
+		observer.ObserveInt64(s.queueItemsGauge, rawCounts[st],
+			otelmetric.WithAttributes(
+				attribute.String("queue", "analyzer_queue"),
+				attribute.String("pipeline_stage", "raw"),
+				attribute.String("state", st),
+			))
+	}
+	analyzedCounts := s.countQueueStates("dispatch_queue", analyzedQueueStates)
+	for _, st := range analyzedQueueStates {
+		observer.ObserveInt64(s.queueItemsGauge, analyzedCounts[st],
+			otelmetric.WithAttributes(
+				attribute.String("queue", "dispatch_queue"),
+				attribute.String("pipeline_stage", "analyzed"),
+				attribute.String("state", st),
+			))
+	}
+
+	// Business FSM on rss_items.
+	statusCounts := s.countItemStatuses(itemStatuses)
+	for _, st := range itemStatuses {
+		observer.ObserveInt64(s.itemStatusGauge, statusCounts[st],
+			otelmetric.WithAttributes(attribute.String("status", st)))
+	}
+
+	// Derived queue-state view used by admin UI.
+	queueStateCounts := s.countDerivedQueueStates(itemQueueStates)
+	for _, st := range itemQueueStates {
+		observer.ObserveInt64(s.itemQueueStateGauge, queueStateCounts[st],
+			otelmetric.WithAttributes(attribute.String("queue_state", st)))
+	}
+	return nil
+}
+
+func (s *Service) countQueueStates(table string, expected []string) map[string]int64 {
+	out := make(map[string]int64, len(expected))
+	for _, st := range expected {
+		out[st] = 0
+	}
+	q := fmt.Sprintf("SELECT state, COUNT(1) FROM %s GROUP BY state", table)
+	rows, err := s.db.Query(q)
+	if err != nil {
+		slog.Warn("count queue states failed", "table", table, "err", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var st string
+		var n int64
+		if err := rows.Scan(&st, &n); err != nil {
+			slog.Warn("scan queue states failed", "table", table, "err", err)
+			return out
+		}
+		out[st] = n
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("rows queue states failed", "table", table, "err", err)
+	}
+	return out
+}
+
+func (s *Service) countItemStatuses(expected []string) map[string]int64 {
+	out := make(map[string]int64, len(expected))
+	for _, st := range expected {
+		out[st] = 0
+	}
+	rows, err := s.db.Query(`SELECT status, COUNT(1) FROM rss_items GROUP BY status`)
+	if err != nil {
+		slog.Warn("count item statuses failed", "err", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var st string
+		var n int64
+		if err := rows.Scan(&st, &n); err != nil {
+			slog.Warn("scan item statuses failed", "err", err)
+			return out
+		}
+		out[st] = n
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("rows item statuses failed", "err", err)
+	}
+	return out
+}
+
+func (s *Service) countDerivedQueueStates(expected []string) map[string]int64 {
+	out := make(map[string]int64, len(expected))
+	for _, st := range expected {
+		out[st] = 0
+	}
+	const q = `
+SELECT queue_state, COUNT(1)
+FROM (
+	SELECT CASE
+		WHEN i.status = 'NEW' AND aq.item_id IS NULL THEN 'not_enqueued_raw'
+		WHEN i.status = 'NEW' AND aq.state = 'QUEUED' THEN 'queued_raw'
+		WHEN i.status = 'NEW' AND aq.state = 'LEASED' THEN 'inflight_raw'
+		WHEN i.status = 'NEW' AND aq.state = 'DONE' THEN 'processed_raw'
+		WHEN i.status = 'ANALYZED' AND i.analyzed_enqueued_at IS NULL THEN 'not_enqueued_analyzed'
+		WHEN i.status = 'ANALYZED' THEN 'queued_analyzed'
+		WHEN i.status = 'DISPATCHED' THEN 'dispatched'
+		WHEN i.status = 'FAILED' THEN 'failed'
+		ELSE 'unknown'
+	END AS queue_state
+	FROM rss_items i
+	LEFT JOIN analyzer_queue aq ON aq.item_id = i.id
+) x
+GROUP BY queue_state
+`
+	rows, err := s.db.Query(q)
+	if err != nil {
+		slog.Warn("count derived queue states failed", "err", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var st string
+		var n int64
+		if err := rows.Scan(&st, &n); err != nil {
+			slog.Warn("scan derived queue states failed", "err", err)
+			return out
+		}
+		out[st] = n
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("rows derived queue states failed", "err", err)
+	}
+	return out
+}
 
 func initDB(db *sql.DB) error {
 	schema := `

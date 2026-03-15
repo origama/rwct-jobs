@@ -63,6 +63,24 @@ Tracce/log/metriche:
 
 - verifica su Grafana Cloud (Explore/Traces/Metrics/Logs).
 - metriche host utili da cercare: `system.cpu.*`, `system.memory.*`, `system.filesystem.*`, `system.network.*`, `system.paging.*`, `system.processes.*`
+- metriche FSM pipeline:
+  - `rwct_pipeline_queue_items{queue,pipeline_stage,state}`
+  - `rwct_pipeline_items_by_status{status}`
+  - `rwct_pipeline_items_by_queue_state{queue_state}`
+
+Esempi PromQL rapidi:
+
+```promql
+sum by (queue, state) (rwct_pipeline_queue_items)
+```
+
+```promql
+sum by (status) (rwct_pipeline_items_by_status)
+```
+
+```promql
+sum by (queue_state) (rwct_pipeline_items_by_queue_state)
+```
 
 Nota sul profilo `obs`:
 

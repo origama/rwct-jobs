@@ -23,9 +23,24 @@ receivers:
         - job_name: "llama_cpp"
           scrape_interval: 15s
           metrics_path: /metrics
-          static_configs:
-            - targets: ["job-analyzer:8080"]
-            - targets: ["llama-cpp:8080"]
+          docker_sd_configs:
+            - host: unix:///var/run/docker.sock
+              refresh_interval: 15s
+          relabel_configs:
+            - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+              regex: (job-analyzer|llama-cpp)
+              action: keep
+            - source_labels: [__meta_docker_port_private]
+              regex: "8080"
+              action: keep
+            - source_labels: [__meta_docker_container_name]
+              regex: "/(.*)"
+              target_label: docker_container_name
+              replacement: "$1"
+            - source_labels: [__meta_docker_network_ip, __meta_docker_port_private]
+              separator: ":"
+              target_label: __address__
+              replacement: "$1:$2"
 
 processors:
   memory_limiter:
@@ -35,6 +50,22 @@ processors:
   batch:
     timeout: 1s
     send_batch_size: 1024
+  transform/enrich:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(resource.attributes["deployment_environment_name"], "${DEPLOY_ENV}")
+          - set(resource.attributes["service.name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
+          - set(resource.attributes["service_name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
+          - set(resource.attributes["service.name"], attributes["docker_container_name"]) where attributes["docker_container_name"] != nil
+          - set(resource.attributes["service_name"], attributes["docker_container_name"]) where attributes["docker_container_name"] != nil
+    log_statements:
+      - context: log
+        statements:
+          - set(resource.attributes["deployment_environment_name"], "${DEPLOY_ENV}")
+          - set(resource.attributes["service.name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
+          - set(resource.attributes["service_name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
 
 exporters:
   prometheus:
@@ -60,11 +91,11 @@ service:
   pipelines:
     metrics:
       receivers: [otlp, hostmetrics, prometheus/llama]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, transform/enrich, batch]
       exporters: [prometheus, otlp_http/grafana_cloud]
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, transform/enrich, batch]
       exporters: [otlp_http/grafana_cloud]
     traces:
       receivers: [otlp]

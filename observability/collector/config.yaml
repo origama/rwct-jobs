@@ -37,10 +37,6 @@ receivers:
               regex: "/(.*)"
               target_label: docker_container_name
               replacement: "$1"
-            - source_labels: [__meta_docker_network_ip, __meta_docker_port_private]
-              separator: ":"
-              target_label: __address__
-              replacement: "$1:$2"
 
 processors:
   resource/enrich_env:

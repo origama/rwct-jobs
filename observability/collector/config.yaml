@@ -43,6 +43,14 @@ receivers:
               replacement: "$1:$2"
 
 processors:
+  resource/enrich_env:
+    attributes:
+      - key: deployment.environment.name
+        value: ${env:DEPLOY_ENV}
+        action: upsert
+      - key: deployment_environment_name
+        value: ${env:DEPLOY_ENV}
+        action: upsert
   memory_limiter:
     check_interval: 2s
     limit_mib: 512
@@ -55,7 +63,8 @@ processors:
     metric_statements:
       - context: datapoint
         statements:
-          - set(resource.attributes["deployment_environment_name"], "${DEPLOY_ENV}")
+          - set(resource.attributes["deployment.environment.name"], "${env:DEPLOY_ENV}")
+          - set(resource.attributes["deployment_environment_name"], "${env:DEPLOY_ENV}")
           - set(resource.attributes["service.name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
           - set(resource.attributes["service_name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
           - set(resource.attributes["service.name"], attributes["docker_container_name"]) where attributes["docker_container_name"] != nil
@@ -63,7 +72,15 @@ processors:
     log_statements:
       - context: log
         statements:
-          - set(resource.attributes["deployment_environment_name"], "${DEPLOY_ENV}")
+          - set(resource.attributes["deployment.environment.name"], "${env:DEPLOY_ENV}")
+          - set(resource.attributes["deployment_environment_name"], "${env:DEPLOY_ENV}")
+          - set(resource.attributes["service.name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
+          - set(resource.attributes["service_name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
+    trace_statements:
+      - context: span
+        statements:
+          - set(resource.attributes["deployment.environment.name"], "${env:DEPLOY_ENV}")
+          - set(resource.attributes["deployment_environment_name"], "${env:DEPLOY_ENV}")
           - set(resource.attributes["service.name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
           - set(resource.attributes["service_name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
 
@@ -91,13 +108,13 @@ service:
   pipelines:
     metrics:
       receivers: [otlp, hostmetrics, prometheus/llama]
-      processors: [memory_limiter, transform/enrich, batch]
+      processors: [memory_limiter, resource/enrich_env, transform/enrich, batch]
       exporters: [prometheus, otlp_http/grafana_cloud]
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, transform/enrich, batch]
+      processors: [memory_limiter, resource/enrich_env, transform/enrich, batch]
       exporters: [otlp_http/grafana_cloud]
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, resource/enrich_env, transform/enrich, batch]
       exporters: [otlp_http/grafana_cloud]

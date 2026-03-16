@@ -10,10 +10,12 @@ import (
 	"html"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -22,6 +24,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
@@ -257,15 +260,19 @@ func (s *Service) recordLLMDuration(ctx context.Context, seconds float64, opts .
 	}
 }
 
-func (s *Service) recordGenAIOperationDuration(ctx context.Context, seconds float64, model string) {
+func (s *Service) recordGenAIOperationDuration(ctx context.Context, seconds float64, model, errorType string) {
 	if s.genAIOperationSec == nil {
 		return
 	}
-	s.genAIOperationSec.Record(ctx, seconds, otelmetric.WithAttributes(
+	attrs := []attribute.KeyValue{
 		attribute.String("gen_ai.operation.name", "chat"),
 		attribute.String("gen_ai.provider.name", "llama_cpp"),
 		attribute.String("gen_ai.request.model", model),
-	))
+	}
+	if strings.TrimSpace(errorType) != "" {
+		attrs = append(attrs, attribute.String("error.type", errorType))
+	}
+	s.genAIOperationSec.Record(ctx, seconds, otelmetric.WithAttributes(attrs...))
 }
 
 func (s *Service) recordGenAITokenUsage(ctx context.Context, tokenType string, tokens int64, model string) {
@@ -278,6 +285,64 @@ func (s *Service) recordGenAITokenUsage(ctx context.Context, tokenType string, t
 		attribute.String("gen_ai.request.model", model),
 		attribute.String("gen_ai.token.type", tokenType),
 	))
+}
+
+func setSpanError(span trace.Span, err error, errType string) {
+	if span == nil || err == nil {
+		return
+	}
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+	if strings.TrimSpace(errType) != "" {
+		span.SetAttributes(attribute.String("error.type", errType))
+	}
+}
+
+func normalizeLLMErrorType(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(msg, "connection refused"):
+		return "connection_refused"
+	case strings.Contains(msg, "no such host"):
+		return "dns_error"
+	case strings.Contains(msg, "tls"):
+		return "tls_error"
+	default:
+		return "llm_request_failed"
+	}
+}
+
+func endpointServerAttributes(rawEndpoint string) []attribute.KeyValue {
+	rawEndpoint = strings.TrimSpace(rawEndpoint)
+	if rawEndpoint == "" {
+		return nil
+	}
+	if !strings.Contains(rawEndpoint, "://") {
+		rawEndpoint = "http://" + rawEndpoint
+	}
+	u, err := url.Parse(rawEndpoint)
+	if err != nil || strings.TrimSpace(u.Hostname()) == "" {
+		return nil
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("server.address", u.Hostname()),
+	}
+	if p := strings.TrimSpace(u.Port()); p != "" {
+		if n, convErr := strconv.Atoi(p); convErr == nil {
+			attrs = append(attrs, attribute.Int("server.port", n))
+		}
+	}
+	return attrs
 }
 
 func (s *Service) addProcessed(ctx context.Context, opts ...otelmetric.AddOption) {
@@ -958,17 +1023,26 @@ func analyzedJobJSONSchema() map[string]any {
 }
 
 func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (string, error) {
-	ctx, span := s.tracerForUse().Start(ctx, "analyzer.call_llm",
-		trace.WithAttributes(
-			attribute.Int("llm.max_tokens", maxTokens),
-			attribute.Int("prompt.chars", len(prompt)),
-			attribute.String("llm.model", s.cfg.LLMModel),
-		))
+	spanAttrs := []attribute.KeyValue{
+		attribute.String("gen_ai.operation.name", "chat"),
+		attribute.String("gen_ai.provider.name", "llama_cpp"),
+		attribute.String("gen_ai.request.model", s.cfg.LLMModel),
+		attribute.Int("gen_ai.request.max_tokens", maxTokens),
+		attribute.Float64("gen_ai.request.temperature", 0.1),
+		attribute.Int("prompt.chars", len(prompt)),
+		attribute.Int("llm.max_tokens", maxTokens),
+		attribute.String("llm.model", s.cfg.LLMModel),
+	}
+	spanAttrs = append(spanAttrs, endpointServerAttributes(s.cfg.LLMEndpoint)...)
+	ctx, span := s.tracerForUse().Start(ctx, fmt.Sprintf("chat %s", s.cfg.LLMModel),
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(spanAttrs...))
 	defer span.End()
 	started := time.Now()
+	var opErrorType string
 	defer s.recordLLMDuration(ctx, time.Since(started).Seconds(),
 		otelmetric.WithAttributes(attribute.String("llm.model", s.cfg.LLMModel)))
-	defer s.recordGenAIOperationDuration(ctx, time.Since(started).Seconds(), s.cfg.LLMModel)
+	defer s.recordGenAIOperationDuration(ctx, time.Since(started).Seconds(), s.cfg.LLMModel, opErrorType)
 
 	timeout := s.computeLLMTimeout(prompt, maxTokens)
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -999,29 +1073,35 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(s.cfg.LLMEndpoint, "/")+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		span.RecordError(err)
+		opErrorType = "request_create_error"
+		setSpanError(span, err, opErrorType)
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.http.Do(req)
 	if err != nil {
-		span.RecordError(err)
+		opErrorType = normalizeLLMErrorType(err)
+		setSpanError(span, err, opErrorType)
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		err := fmt.Errorf("llm status: %d", resp.StatusCode)
-		span.RecordError(err)
+		opErrorType = "http_error"
+		setSpanError(span, err, opErrorType)
 		span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 		return "", err
 	}
 
 	var r struct {
+		ID      string `json:"id"`
+		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
 				Content string `json:"content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
 			PromptTokens     int64 `json:"prompt_tokens"`
@@ -1029,14 +1109,45 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		span.RecordError(err)
+		opErrorType = "response_decode_error"
+		setSpanError(span, err, opErrorType)
 		return "", err
 	}
 	if len(r.Choices) == 0 {
 		err := errors.New("empty llm response")
-		span.RecordError(err)
+		opErrorType = "empty_response"
+		setSpanError(span, err, opErrorType)
 		return "", err
 	}
+	respModel := strings.TrimSpace(r.Model)
+	if respModel == "" {
+		respModel = s.cfg.LLMModel
+	}
+	responseAttrs := []attribute.KeyValue{
+		attribute.String("gen_ai.response.model", respModel),
+		attribute.Int64("gen_ai.usage.input_tokens", r.Usage.PromptTokens),
+		attribute.Int64("gen_ai.usage.output_tokens", r.Usage.CompletionTokens),
+	}
+	if id := strings.TrimSpace(r.ID); id != "" {
+		responseAttrs = append(responseAttrs, attribute.String("gen_ai.response.id", id))
+	}
+	finishSet := map[string]struct{}{}
+	finishReasons := make([]string, 0, len(r.Choices))
+	for _, ch := range r.Choices {
+		reason := strings.TrimSpace(ch.FinishReason)
+		if reason == "" {
+			continue
+		}
+		if _, ok := finishSet[reason]; ok {
+			continue
+		}
+		finishSet[reason] = struct{}{}
+		finishReasons = append(finishReasons, reason)
+	}
+	if len(finishReasons) > 0 {
+		responseAttrs = append(responseAttrs, attribute.StringSlice("gen_ai.response.finish_reasons", finishReasons))
+	}
+	span.SetAttributes(responseAttrs...)
 	s.recordGenAITokenUsage(ctx, "input", r.Usage.PromptTokens, s.cfg.LLMModel)
 	s.recordGenAITokenUsage(ctx, "output", r.Usage.CompletionTokens, s.cfg.LLMModel)
 	return stripMarkdownCodeFence(strings.TrimSpace(r.Choices[0].Message.Content)), nil

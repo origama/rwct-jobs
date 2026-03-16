@@ -69,7 +69,7 @@ func TestHandleItemRequeueClearsDispatchedAndEnqueues(t *testing.T) {
 	}
 }
 
-func TestHandleItemRequeueRejectsMissingAnalyzedPayload(t *testing.T) {
+func TestHandleItemRequeueEnqueuesRawWhenAnalyzedPayloadMissing(t *testing.T) {
 	t.Parallel()
 
 	dbPath := filepath.Join(t.TempDir(), "webadmin.db")
@@ -92,16 +92,28 @@ func TestHandleItemRequeueRejectsMissingAnalyzedPayload(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/db/items/requeue", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	svc.handleItemRequeue(rec, req)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("expected 409, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	var count int
-	err = svc.db.QueryRow(`SELECT COUNT(1) FROM dispatch_queue WHERE item_id = ?`, itemID).Scan(&count)
+	var status string
+	err = svc.db.QueryRow(`SELECT status FROM rss_items WHERE id = ?`, itemID).Scan(&status)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 0 {
-		t.Fatalf("expected no queued dispatch row, got %d", count)
+	if status != events.ItemStatusNew {
+		t.Fatalf("expected status NEW, got %s", status)
+	}
+
+	var qState, payload string
+	err = svc.db.QueryRow(`SELECT state, payload_json FROM analyzer_queue WHERE item_id = ?`, itemID).Scan(&qState, &payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qState != "QUEUED" {
+		t.Fatalf("expected analyzer_queue QUEUED, got %s", qState)
+	}
+	if payload == "" {
+		t.Fatalf("expected raw payload in analyzer_queue")
 	}
 }

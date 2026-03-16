@@ -10,6 +10,7 @@ LLAMA_NGL="${LLAMA_NGL:-0}"
 # New name: LLM_PARALLEL_THREADS. Keep LLAMA_THREADS as legacy fallback.
 LLAMA_THREADS="${LLM_PARALLEL_THREADS:-${LLAMA_THREADS:--1}}"
 LLAMA_EXTRA_ARGS="${LLAMA_EXTRA_ARGS:-}"
+LLAMA_ENABLE_METRICS="${LLAMA_ENABLE_METRICS:-true}"
 
 if [[ ! -f "${MODEL_PATH}" ]]; then
   echo "model not found: ${MODEL_PATH}" >&2
@@ -17,6 +18,10 @@ if [[ ! -f "${MODEL_PATH}" ]]; then
 fi
 
 read -r -a EXTRA_ARGS <<< "${LLAMA_EXTRA_ARGS}"
+METRICS_ARGS=()
+if [[ "${LLAMA_ENABLE_METRICS,,}" == "1" || "${LLAMA_ENABLE_METRICS,,}" == "true" || "${LLAMA_ENABLE_METRICS,,}" == "yes" || "${LLAMA_ENABLE_METRICS,,}" == "on" ]]; then
+  METRICS_ARGS+=(--metrics)
+fi
 
 export MQTT_CLIENT_ID="job-analyzer-${HOSTNAME}"
 export LLM_ENDPOINT="http://127.0.0.1:${LLAMA_PORT}"
@@ -28,6 +33,7 @@ export LLM_ENDPOINT="http://127.0.0.1:${LLAMA_PORT}"
   -c "${LLAMA_CTX}" \
   -ngl "${LLAMA_NGL}" \
   -t "${LLAMA_THREADS}" \
+  "${METRICS_ARGS[@]}" \
   "${EXTRA_ARGS[@]}" &
 LLAMA_PID=$!
 

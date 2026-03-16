@@ -17,6 +17,15 @@ receivers:
       network:
       paging:
       processes:
+  prometheus/llama:
+    config:
+      scrape_configs:
+        - job_name: "llama_cpp"
+          scrape_interval: 15s
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["job-analyzer:8080"]
+            - targets: ["llama-cpp:8080"]
 
 processors:
   memory_limiter:
@@ -50,7 +59,7 @@ service:
   extensions: [health_check, basicauth/grafana_cloud]
   pipelines:
     metrics:
-      receivers: [otlp, hostmetrics]
+      receivers: [otlp, hostmetrics, prometheus/llama]
       processors: [memory_limiter, batch]
       exporters: [prometheus, otlp_http/grafana_cloud]
     logs:

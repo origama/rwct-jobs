@@ -5,6 +5,7 @@
 Tutti i componenti applicativi inviano segnali OpenTelemetry all'istanza locale `otel-collector`:
 
 - Metriche: OTel SDK -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
+- Metriche `llama.cpp`: receiver Prometheus del collector (scrape `job-analyzer:8080/metrics` e `llama-cpp:8080/metrics`) -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
 - Log: OTel SDK/bridge slog -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
 - Tracce: OTel SDK -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
 - Metriche host: receiver `hostmetrics` nel collector (CPU, memoria, disco/filesystem, rete, paging, process count)

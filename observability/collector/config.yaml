@@ -48,9 +48,6 @@ processors:
       - key: deployment.environment.name
         value: ${env:DEPLOY_ENV}
         action: upsert
-      - key: deployment_environment_name
-        value: ${env:DEPLOY_ENV}
-        action: upsert
   memory_limiter:
     check_interval: 2s
     limit_mib: 512
@@ -64,7 +61,6 @@ processors:
       - context: datapoint
         statements:
           - set(resource.attributes["deployment.environment.name"], "${env:DEPLOY_ENV}")
-          - set(resource.attributes["deployment_environment_name"], "${env:DEPLOY_ENV}")
           - set(resource.attributes["service.name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
           - set(resource.attributes["service_name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
           - set(resource.attributes["service.name"], attributes["docker_container_name"]) where attributes["docker_container_name"] != nil
@@ -73,14 +69,12 @@ processors:
       - context: log
         statements:
           - set(resource.attributes["deployment.environment.name"], "${env:DEPLOY_ENV}")
-          - set(resource.attributes["deployment_environment_name"], "${env:DEPLOY_ENV}")
           - set(resource.attributes["service.name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
           - set(resource.attributes["service_name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
     trace_statements:
       - context: span
         statements:
           - set(resource.attributes["deployment.environment.name"], "${env:DEPLOY_ENV}")
-          - set(resource.attributes["deployment_environment_name"], "${env:DEPLOY_ENV}")
           - set(resource.attributes["service.name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
           - set(resource.attributes["service_name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil
 

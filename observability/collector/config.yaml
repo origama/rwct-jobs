@@ -59,8 +59,6 @@ processors:
     metric_statements:
       - context: datapoint
         statements:
-          - set(attributes["deployment_environment_name"], "${env:DEPLOY_ENV}")
-          - set(attributes["deployment.environment.name"], "${env:DEPLOY_ENV}")
           - set(resource.attributes["deployment.environment.name"], "${env:DEPLOY_ENV}")
           - set(resource.attributes["deployment_environment_name"], "${env:DEPLOY_ENV}")
           - set(resource.attributes["service.name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil

@@ -44,6 +44,44 @@ processors:
       - key: deployment.environment.name
         value: ${env:DEPLOY_ENV}
         action: upsert
+  metricstransform/genai_semconv:
+    transforms:
+      - include: rwct_analyzer_llm_duration_seconds
+        action: update
+        new_name: gen_ai.client.operation.duration
+        operations:
+          - action: add_label
+            new_label: gen_ai.operation.name
+            new_value: chat
+          - action: add_label
+            new_label: gen_ai.provider.name
+            new_value: llama_cpp
+      - include: llamacpp:prompt_tokens_total
+        action: update
+        new_name: gen_ai.client.token.usage
+        operations:
+          - action: add_label
+            new_label: gen_ai.token.type
+            new_value: input
+          - action: add_label
+            new_label: gen_ai.operation.name
+            new_value: chat
+          - action: add_label
+            new_label: gen_ai.provider.name
+            new_value: llama_cpp
+      - include: llamacpp:tokens_predicted_total
+        action: update
+        new_name: gen_ai.client.token.usage
+        operations:
+          - action: add_label
+            new_label: gen_ai.token.type
+            new_value: output
+          - action: add_label
+            new_label: gen_ai.operation.name
+            new_value: chat
+          - action: add_label
+            new_label: gen_ai.provider.name
+            new_value: llama_cpp
   memory_limiter:
     check_interval: 2s
     limit_mib: 512
@@ -94,7 +132,7 @@ service:
   pipelines:
     metrics:
       receivers: [otlp, hostmetrics, prometheus/llama]
-      processors: [memory_limiter, resource/enrich_env, transform/enrich, batch]
+      processors: [memory_limiter, resource/enrich_env, metricstransform/genai_semconv, transform/enrich, batch]
       exporters: [prometheus, otlp_http/grafana_cloud]
     logs:
       receivers: [otlp]

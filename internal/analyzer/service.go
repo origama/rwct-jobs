@@ -111,6 +111,8 @@ type Service struct {
 
 	analyzeDurationSec   otelmetric.Float64Histogram
 	llmDurationSec       otelmetric.Float64Histogram
+	genAIOperationSec    otelmetric.Float64Histogram
+	genAITokenUsage      otelmetric.Int64Histogram
 	jobsProcessed        otelmetric.Int64Counter
 	jobsFailed           otelmetric.Int64Counter
 	sourceScrapeFailures otelmetric.Int64Counter
@@ -188,6 +190,10 @@ func New(cfg Config) (*Service, error) {
 			"Duration of analyzer jobs"),
 		llmDurationSec: mustFloat64Histogram("rwct_analyzer_llm_duration_seconds",
 			"Duration of LLM requests from analyzer"),
+		genAIOperationSec: mustFloat64HistogramWithUnit("gen_ai.client.operation.duration",
+			"Duration of GenAI client operations", "s"),
+		genAITokenUsage: mustInt64HistogramWithUnit("gen_ai.client.token.usage",
+			"Number of input and output tokens used per GenAI client operation", "{token}"),
 		jobsProcessed: mustInt64Counter("rwct_analyzer_jobs_total",
 			"Number of analyzer jobs processed"),
 		jobsFailed: mustInt64Counter("rwct_analyzer_job_failures_total",
@@ -213,6 +219,20 @@ func mustFloat64Histogram(name, description string) otelmetric.Float64Histogram 
 	return h
 }
 
+func mustFloat64HistogramWithUnit(name, description, unit string) otelmetric.Float64Histogram {
+	h, _ := analyzerMeter().Float64Histogram(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit))
+	return h
+}
+
+func mustInt64HistogramWithUnit(name, description, unit string) otelmetric.Int64Histogram {
+	h, _ := analyzerMeter().Int64Histogram(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit))
+	return h
+}
+
 func mustInt64Counter(name, description string) otelmetric.Int64Counter {
 	c, _ := analyzerMeter().Int64Counter(name, otelmetric.WithDescription(description))
 	return c
@@ -235,6 +255,29 @@ func (s *Service) recordLLMDuration(ctx context.Context, seconds float64, opts .
 	if s.llmDurationSec != nil {
 		s.llmDurationSec.Record(ctx, seconds, opts...)
 	}
+}
+
+func (s *Service) recordGenAIOperationDuration(ctx context.Context, seconds float64, model string) {
+	if s.genAIOperationSec == nil {
+		return
+	}
+	s.genAIOperationSec.Record(ctx, seconds, otelmetric.WithAttributes(
+		attribute.String("gen_ai.operation.name", "chat"),
+		attribute.String("gen_ai.provider.name", "llama_cpp"),
+		attribute.String("gen_ai.request.model", model),
+	))
+}
+
+func (s *Service) recordGenAITokenUsage(ctx context.Context, tokenType string, tokens int64, model string) {
+	if s.genAITokenUsage == nil || tokens <= 0 {
+		return
+	}
+	s.genAITokenUsage.Record(ctx, tokens, otelmetric.WithAttributes(
+		attribute.String("gen_ai.operation.name", "chat"),
+		attribute.String("gen_ai.provider.name", "llama_cpp"),
+		attribute.String("gen_ai.request.model", model),
+		attribute.String("gen_ai.token.type", tokenType),
+	))
 }
 
 func (s *Service) addProcessed(ctx context.Context, opts ...otelmetric.AddOption) {
@@ -925,6 +968,7 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 	started := time.Now()
 	defer s.recordLLMDuration(ctx, time.Since(started).Seconds(),
 		otelmetric.WithAttributes(attribute.String("llm.model", s.cfg.LLMModel)))
+	defer s.recordGenAIOperationDuration(ctx, time.Since(started).Seconds(), s.cfg.LLMModel)
 
 	timeout := s.computeLLMTimeout(prompt, maxTokens)
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -979,6 +1023,10 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		span.RecordError(err)
@@ -989,6 +1037,8 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 		span.RecordError(err)
 		return "", err
 	}
+	s.recordGenAITokenUsage(ctx, "input", r.Usage.PromptTokens, s.cfg.LLMModel)
+	s.recordGenAITokenUsage(ctx, "output", r.Usage.CompletionTokens, s.cfg.LLMModel)
 	return stripMarkdownCodeFence(strings.TrimSpace(r.Choices[0].Message.Content)), nil
 }
 

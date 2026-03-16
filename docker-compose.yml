@@ -8,6 +8,7 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.147.0
     container_name: rwct-otel-collector
+    user: "0:0"
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     env_file:
       - .env.secrets

@@ -205,7 +205,7 @@ services:
       LLM_ENDPOINT: http://127.0.0.1:8080
       LLAMA_HOST: 0.0.0.0
       LLAMA_PORT: 8080
-      LLAMA_CTX: 4096
+      LLAMA_CTX: ${LLAMA_CTX:-4096}
       LLAMA_NGL: 0
       LLM_PARALLEL_THREADS: ${LLM_PARALLEL_THREADS:--1}
     depends_on:

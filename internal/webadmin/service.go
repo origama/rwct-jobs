@@ -34,10 +34,10 @@ type Service struct {
 	db   *sql.DB
 	http *http.Server
 
-	metricsReg           otelmetric.Registration
-	queueItemsGauge      otelmetric.Int64ObservableGauge
-	itemStatusGauge      otelmetric.Int64ObservableGauge
-	itemQueueStateGauge  otelmetric.Int64ObservableGauge
+	metricsReg          otelmetric.Registration
+	queueItemsGauge     otelmetric.Int64ObservableGauge
+	itemStatusGauge     otelmetric.Int64ObservableGauge
+	itemQueueStateGauge otelmetric.Int64ObservableGauge
 }
 
 type feedRow struct {
@@ -78,6 +78,27 @@ type queueDepthRow struct {
 	Name   string `json:"name"`
 	Topic  string `json:"topic"`
 	Queued int64  `json:"queued"`
+}
+
+type boardLaneRow struct {
+	Name  string         `json:"name"`
+	Title string         `json:"title"`
+	Count int64          `json:"count"`
+	Items []boardItemRow `json:"items"`
+}
+
+type boardItemRow struct {
+	ID            string    `json:"id"`
+	Title         string    `json:"title"`
+	URL           string    `json:"url"`
+	Status        string    `json:"status"`
+	Lane          string    `json:"lane"`
+	QueueState    string    `json:"queue_state"`
+	SourceFeedURL string    `json:"source_feed_url"`
+	SourceLabel   string    `json:"source_label"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	LastError     string    `json:"last_error,omitempty"`
 }
 
 type ratioPoint struct {
@@ -527,6 +548,7 @@ func (s *Service) Run(ctx context.Context) error {
 	mux.HandleFunc("/api/db/items/analyzed", s.handleItemAnalyzedVersion)
 	mux.HandleFunc("/api/db/items/status", s.handleItemStatus)
 	mux.HandleFunc("/api/monitor/queues", s.handleQueueMonitor)
+	mux.HandleFunc("/api/monitor/board", s.handleBoardMonitor)
 	mux.HandleFunc("/api/runtime/analyzers", s.handleAnalyzerRuntime)
 
 	s.http = &http.Server{
@@ -903,11 +925,34 @@ func (s *Service) handleItemRequeue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var analyzedJSON string
+	var sourceFeedURL, guid, rawURL, title, description, linksJSON, imagesJSON string
+	var publishedRaw, fetchedRaw sql.NullString
 	err := s.db.QueryRow(
-		`SELECT COALESCE(analyzed_payload_json,'')
+		`SELECT
+			COALESCE(analyzed_payload_json,''),
+			COALESCE(source_feed_url,''),
+			COALESCE(guid,''),
+			COALESCE(url,''),
+			COALESCE(title,''),
+			COALESCE(description,''),
+			COALESCE(links_json,'[]'),
+			COALESCE(image_urls_json,'[]'),
+			CAST(published_at AS TEXT),
+			CAST(fetched_at AS TEXT)
 FROM rss_items WHERE id = ?`,
 		itemID,
-	).Scan(&analyzedJSON)
+	).Scan(
+		&analyzedJSON,
+		&sourceFeedURL,
+		&guid,
+		&rawURL,
+		&title,
+		&description,
+		&linksJSON,
+		&imagesJSON,
+		&publishedRaw,
+		&fetchedRaw,
+	)
 	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "item not found"})
 		return
@@ -919,9 +964,70 @@ FROM rss_items WHERE id = ?`,
 
 	now := time.Now().UTC()
 	if strings.TrimSpace(analyzedJSON) == "" {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "missing analyzed payload: requeue richiede una processed version già disponibile",
-		})
+		var links, images []string
+		_ = json.Unmarshal([]byte(linksJSON), &links)
+		_ = json.Unmarshal([]byte(imagesJSON), &images)
+
+		publishedAt := now
+		if publishedRaw.Valid {
+			if t, ok := parseDBTime(publishedRaw.String); ok {
+				publishedAt = t.Time.UTC()
+			}
+		}
+		fetchedAt := now
+		if fetchedRaw.Valid {
+			if t, ok := parseDBTime(fetchedRaw.String); ok {
+				fetchedAt = t.Time.UTC()
+			}
+		}
+
+		rawEvent := events.RawJobItem{
+			SchemaVersion: events.SchemaVersion,
+			ID:            itemID,
+			FeedURL:       strings.TrimSpace(sourceFeedURL),
+			SourceLabel:   sourceLabelFromFeedURL(sourceFeedURL),
+			GUID:          strings.TrimSpace(guid),
+			URL:           strings.TrimSpace(rawURL),
+			Title:         strings.TrimSpace(title),
+			Description:   strings.TrimSpace(description),
+			Links:         links,
+			ImageURLs:     images,
+			PublishedAt:   publishedAt,
+			FetchedAt:     fetchedAt,
+		}
+		payload, err := json.Marshal(rawEvent)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		_, err = s.db.Exec(
+			`INSERT INTO analyzer_queue(item_id, payload_json, state, enqueued_at, updated_at)
+VALUES(?, ?, 'QUEUED', ?, ?)
+ON CONFLICT(item_id) DO UPDATE SET
+ payload_json=excluded.payload_json,
+ state='QUEUED',
+ lease_owner=NULL,
+ lease_until=NULL,
+ last_error='',
+ updated_at=excluded.updated_at`,
+			itemID, string(payload), now, now,
+		)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		_, _ = s.db.Exec(
+			`UPDATE rss_items
+			 SET status=?,
+			     raw_enqueued_at=COALESCE(?, raw_enqueued_at),
+			     raw_enqueue_count=COALESCE(raw_enqueue_count,0)+1,
+			     last_error='',
+			     dispatched_at=NULL,
+			     updated_at=?
+			 WHERE id=?`,
+			events.ItemStatusNew, now, now, itemID,
+		)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": "raw"})
 		return
 	}
 
@@ -1180,6 +1286,151 @@ ORDER BY updated_at DESC
 	writeJSON(w, http.StatusOK, map[string]any{"analyzers": out})
 }
 
+func (s *Service) handleBoardMonitor(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	limitPerLane := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit_per_lane")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 500 {
+			limitPerLane = n
+		}
+	}
+
+	rows, err := s.db.Query(`
+SELECT
+ i.id,
+ i.title,
+ i.url,
+ i.status,
+ CASE
+   WHEN aq.state = 'LEASED' THEN 'raw_inflight'
+   WHEN aq.state = 'QUEUED' THEN 'raw_backlog'
+   WHEN dq.state = 'LEASED' THEN 'analyzed_inflight'
+   WHEN dq.state = 'QUEUED' THEN 'analyzed_backlog'
+   WHEN i.status = 'FAILED' THEN 'failed'
+   WHEN i.status = 'DISPATCHED' THEN ''
+   WHEN i.status = 'ANALYZED' AND dq.state = 'DONE' THEN 'anomalies'
+   WHEN i.status = 'NEW' AND aq.state = 'DONE' THEN 'anomalies'
+   WHEN i.status = 'ANALYZED' AND dq.item_id IS NULL THEN 'anomalies'
+   WHEN i.status = 'NEW' AND aq.item_id IS NULL THEN 'anomalies'
+   ELSE ''
+ END AS lane,
+ CASE
+   WHEN aq.state = 'LEASED' THEN 'inflight_raw'
+   WHEN aq.state = 'QUEUED' THEN 'queued_raw'
+   WHEN aq.state = 'DONE' THEN 'processed_raw'
+   WHEN dq.state = 'LEASED' THEN 'inflight_analyzed'
+   WHEN dq.state = 'QUEUED' THEN 'queued_analyzed'
+   WHEN dq.state = 'DONE' THEN 'processed_analyzed'
+   WHEN i.status = 'NEW' AND aq.item_id IS NULL THEN 'not_enqueued_raw'
+   WHEN i.status = 'ANALYZED' AND dq.item_id IS NULL THEN 'not_enqueued_analyzed'
+   WHEN i.status = 'DISPATCHED' THEN 'dispatched'
+   WHEN i.status = 'FAILED' THEN 'failed'
+   ELSE 'unknown'
+ END AS queue_state,
+ i.source_feed_url,
+ i.created_at,
+ i.updated_at,
+ COALESCE(i.last_error,'') AS last_error,
+ CASE
+   WHEN i.status = 'NEW' THEN COALESCE(aq.enqueued_at, i.created_at, i.updated_at)
+   WHEN i.status = 'ANALYZED' THEN COALESCE(dq.enqueued_at, i.analyzed_enqueued_at, i.updated_at, i.created_at)
+   ELSE COALESCE(i.updated_at, i.created_at)
+ END AS fifo_ts
+FROM rss_items i
+LEFT JOIN analyzer_queue aq ON aq.item_id = i.id
+LEFT JOIN dispatch_queue dq ON dq.item_id = i.id
+ORDER BY
+ CASE
+   WHEN aq.state = 'QUEUED' THEN 1
+   WHEN aq.state = 'LEASED' THEN 2
+   WHEN dq.state = 'QUEUED' THEN 3
+   WHEN dq.state = 'LEASED' THEN 4
+   WHEN i.status = 'FAILED' THEN 5
+   ELSE 6
+ END,
+ fifo_ts ASC,
+ i.created_at ASC
+`)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	laneOrder := []string{"raw_backlog", "raw_inflight", "analyzed_backlog", "analyzed_inflight", "failed", "anomalies"}
+	laneTitles := map[string]string{
+		"raw_backlog":       "Raw Backlog",
+		"raw_inflight":      "Raw Inflight",
+		"analyzed_backlog":  "Analyzed Backlog",
+		"analyzed_inflight": "Analyzed Inflight",
+		"failed":            "Failed",
+		"anomalies":         "Anomalies",
+	}
+	laneCounts := map[string]int64{}
+	laneItems := map[string][]boardItemRow{}
+	for _, ln := range laneOrder {
+		laneCounts[ln] = 0
+		laneItems[ln] = make([]boardItemRow, 0)
+	}
+
+	for rows.Next() {
+		var it boardItemRow
+		var lane string
+		var sourceFeedURL sql.NullString
+		if err := rows.Scan(
+			&it.ID,
+			&it.Title,
+			&it.URL,
+			&it.Status,
+			&lane,
+			&it.QueueState,
+			&sourceFeedURL,
+			&it.CreatedAt,
+			&it.UpdatedAt,
+			&it.LastError,
+			new(sql.NullString), // fifo_ts ignored in payload, used only for sorting in SQL
+		); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if lane == "" {
+			continue
+		}
+		it.Lane = lane
+		if sourceFeedURL.Valid {
+			it.SourceFeedURL = sourceFeedURL.String
+		}
+		it.SourceLabel = sourceLabelFromFeedURL(it.SourceFeedURL)
+
+		laneCounts[lane]++
+		if len(laneItems[lane]) < limitPerLane {
+			laneItems[lane] = append(laneItems[lane], it)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	out := make([]boardLaneRow, 0, len(laneOrder))
+	for _, ln := range laneOrder {
+		out = append(out, boardLaneRow{
+			Name:  ln,
+			Title: laneTitles[ln],
+			Count: laneCounts[ln],
+			Items: laneItems[ln],
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"limit_per_lane": limitPerLane,
+		"lanes":          out,
+	})
+}
+
 func (s *Service) last3HoursRatioPoints() ([]ratioPoint, error) {
 	now := time.Now().UTC().Truncate(time.Minute)
 	start := now.Add(-179 * time.Minute)
@@ -1401,166 +1652,177 @@ const indexHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RWCT DB Explorer</title>
+<title>RWCT Web Admin</title>
 <style>
-:root { color-scheme: light; }
-body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#f5f7fb; color:#1f2937; }
-header { padding:14px 18px; background:#0f172a; color:#e2e8f0; }
-main { padding:16px; display:grid; grid-template-columns: 460px 1fr; gap:14px; }
-.card { background:#fff; border:1px solid #dbe2ea; border-radius:10px; padding:12px; }
-h1, h2, h3 { margin:0 0 10px; }
-h1 { font-size:16px; }
-h2 { font-size:14px; }
-.small { font-size:12px; color:#64748b; }
-.row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-.pill { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid #cbd5e1; background:#f8fafc; }
-.pill.ok { color:#166534; border-color:#86efac; background:#f0fdf4; }
-.pill.off { color:#7f1d1d; border-color:#fca5a5; background:#fef2f2; }
-.pill.warn { color:#9a3412; border-color:#fdba74; background:#fff7ed; }
-.monitor-grid { display:grid; grid-template-columns:1fr; gap:8px; margin-bottom:10px; }
-.monitor-box { border:1px solid #e2e8f0; border-radius:8px; padding:8px; background:#f8fafc; }
-.monitor-box details { margin:0; }
-.monitor-box summary { list-style:none; cursor:pointer; display:flex; align-items:center; justify-content:space-between; gap:8px; }
-.monitor-box summary::-webkit-details-marker { display:none; }
-.monitor-box summary::after { content:'+'; font-weight:700; color:#64748b; }
-.monitor-box details[open] summary::after { content:'-'; }
-.monitor-content { margin-top:8px; }
-.badge-stack { display:flex; gap:6px; flex-wrap:wrap; }
-.analyzer-list { display:grid; grid-template-columns:1fr; gap:8px; }
-.analyzer-card { border:1px solid #dbe2ea; border-radius:8px; padding:8px; background:#fff; }
-.analyzer-head { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; margin-bottom:6px; }
-.analyzer-meta { display:grid; grid-template-columns:1fr 1fr; gap:6px 10px; }
-.analyzer-meta div { font-size:12px; color:#475569; }
-.queue-list { display:grid; grid-template-columns:1fr; gap:6px; margin-top:6px; }
-.queue-row { display:flex; justify-content:space-between; align-items:center; font-size:12px; gap:8px; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
-.chart-wrap { margin-top:8px; border:1px solid #e2e8f0; border-radius:8px; padding:6px; background:#fff; }
-.chart-legend { display:flex; gap:10px; align-items:center; font-size:11px; color:#64748b; margin:6px 0 2px; }
-.dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
-.dot.new { background:#0284c7; }
-.dot.disp { background:#16a34a; }
-.dot.ratio { background:#9333ea; }
-.requeue-panel { margin-bottom:10px; padding:10px; border:1px solid #e2e8f0; border-radius:10px; background:#f8fafc; display:none; }
-.requeue-head { display:flex; gap:8px; align-items:center; justify-content:space-between; margin-bottom:6px; }
-.requeue-flow { display:flex; align-items:center; gap:8px; margin-top:8px; flex-wrap:wrap; }
-.flow-step { font-size:12px; padding:4px 8px; border-radius:999px; border:1px solid #cbd5e1; background:#fff; color:#475569; }
-.flow-step.active { border-color:#38bdf8; color:#0369a1; background:#f0f9ff; }
-.flow-step.done { border-color:#86efac; color:#166534; background:#f0fdf4; }
-.flow-step.fail { border-color:#fca5a5; color:#7f1d1d; background:#fef2f2; }
-.flow-link { width:18px; height:2px; background:#cbd5e1; border-radius:2px; }
-.spinner { width:10px; height:10px; border-radius:50%; border:2px solid #bae6fd; border-top-color:#0284c7; animation:spin 800ms linear infinite; display:inline-block; margin-right:6px; vertical-align:middle; }
+:root {
+  color-scheme: light;
+  --bg: #f3f6fb;
+  --card: #ffffff;
+  --border: #d6deeb;
+  --text: #1d2939;
+  --muted: #667085;
+  --accent: #0f172a;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; font-family: "Segoe UI", Tahoma, sans-serif; color: var(--text); background: var(--bg); }
+.app { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; transition: grid-template-columns .2s ease; }
+.app.sidebar-collapsed { grid-template-columns: 64px 1fr; }
+.sidebar { background: #0b1220; color: #e2e8f0; border-right: 1px solid #1f2937; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+.brand { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.brand-title { font-size: 14px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.collapse-btn { border: 1px solid #334155; color: #e2e8f0; background: #0f172a; border-radius: 8px; padding: 6px 8px; cursor: pointer; }
+.view-nav { display: grid; gap: 6px; }
+.view-btn { text-align: left; border: 1px solid #1f2937; background: transparent; color: #e2e8f0; border-radius: 10px; padding: 10px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.view-btn.active { background: #1e293b; border-color: #334155; }
+.sidebar-collapsed .brand-title, .sidebar-collapsed .view-label, .sidebar-collapsed .sidebar-footer { display: none; }
+.content { padding: 14px; display: grid; gap: 12px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.top-title { font-size: 18px; font-weight: 700; margin: 0; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 10px; }
+.small { font-size: 12px; color: var(--muted); }
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid #cbd5e1; background: #f8fafc; }
+.pill.ok { color: #166534; border-color: #86efac; background: #f0fdf4; }
+.pill.warn { color: #9a3412; border-color: #fdba74; background: #fff7ed; }
+.pill.off { color: #7f1d1d; border-color: #fca5a5; background: #fef2f2; }
+button { border: 1px solid #94a3b8; border-radius: 8px; background: #fff; padding: 6px 8px; cursor: pointer; }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.tiny { padding: 4px 6px; font-size: 11px; }
+input { border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px 8px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+.views { display: grid; gap: 10px; }
+.view { display: none; }
+.view.active { display: block; }
+.feed-layout { display: grid; grid-template-columns: 420px 1fr; gap: 10px; }
+.table-wrap { max-height: 70vh; overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { border-bottom: 1px solid #e2e8f0; text-align: left; padding: 8px; vertical-align: top; }
+tr:hover { background: #f8fafc; }
+tr.selected { background: #e2e8f0; }
+.url { word-break: break-all; }
+.kanban-shell { display: grid; gap: 10px; }
+.lanes { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(280px, 1fr); gap: 10px; overflow-x: auto; padding-bottom: 4px; }
+.lane { border: 1px solid var(--border); border-radius: 12px; background: #fff; min-height: 60vh; display: grid; grid-template-rows: auto 1fr; }
+.lane-head { padding: 10px; border-bottom: 1px solid var(--border); background: #f8fafc; display: flex; justify-content: space-between; align-items: center; gap: 8px; position: sticky; top: 0; z-index: 1; }
+.lane-title { font-size: 13px; font-weight: 700; }
+.lane-items { padding: 8px; display: grid; gap: 8px; align-content: start; }
+.item-card { border: 1px solid #dbe2ea; border-radius: 10px; padding: 8px; background: #fff; display: grid; gap: 6px; }
+.item-title { font-size: 13px; font-weight: 600; line-height: 1.3; }
+.item-meta { font-size: 11px; color: var(--muted); display: grid; gap: 2px; }
+.item-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.muted { color: var(--muted); }
+.requeue-panel { margin-bottom: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: #f8fafc; display: none; }
+.requeue-flow { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.flow-step { font-size: 12px; padding: 4px 8px; border-radius: 999px; border: 1px solid #cbd5e1; background: #fff; color: #475569; }
+.flow-step.active { border-color: #38bdf8; color: #0369a1; background: #f0f9ff; }
+.flow-step.done { border-color: #86efac; color: #166534; background: #f0fdf4; }
+.flow-step.fail { border-color: #fca5a5; color: #7f1d1d; background: #fef2f2; }
+.flow-link { width: 18px; height: 2px; background: #cbd5e1; border-radius: 2px; }
+.spinner { width: 10px; height: 10px; border-radius: 50%; border: 2px solid #bae6fd; border-top-color: #0284c7; animation: spin 800ms linear infinite; display: inline-block; margin-right: 6px; vertical-align: middle; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.table-wrap { max-height:70vh; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; }
-table { width:100%; border-collapse:collapse; font-size:12px; }
-th, td { text-align:left; padding:8px; border-bottom:1px solid #e2e8f0; vertical-align:top; }
-tr:hover { background:#f8fafc; }
-tr.selected { background:#e2e8f0; }
-button { border:1px solid #94a3b8; background:#fff; border-radius:6px; padding:5px 8px; cursor:pointer; font-size:12px; }
-button.primary { background:#0f172a; color:#fff; border-color:#0f172a; }
-.url { word-break:break-all; }
-.modal-backdrop { position:fixed; inset:0; background:rgba(2,6,23,0.48); display:none; align-items:center; justify-content:center; z-index:40; padding:20px; }
-.modal { width:min(980px, 96vw); max-height:90vh; overflow:auto; border:1px solid #22304a; border-radius:12px; background:#0b1220; color:#e5e7eb; }
-.modal-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px 12px; border-bottom:1px solid #22304a; position:sticky; top:0; background:#0b1220; }
-.modal-title { font-size:13px; font-weight:600; color:#cbd5e1; }
-.code { margin:0; padding:12px; font-size:12px; line-height:1.45; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space:pre-wrap; word-break:break-word; }
-.j-key { color:#7dd3fc; }
-.j-str { color:#a7f3d0; }
-.j-num { color:#fde68a; }
-.j-bool { color:#fca5a5; }
-.j-null { color:#c4b5fd; }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(2,6,23,.5); display: none; align-items: center; justify-content: center; z-index: 40; padding: 20px; }
+.modal { width: min(980px, 96vw); max-height: 90vh; overflow: auto; border: 1px solid #22304a; border-radius: 12px; background: #0b1220; color: #e5e7eb; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid #22304a; position: sticky; top: 0; background: #0b1220; }
+.code { margin: 0; padding: 12px; font-size: 12px; line-height: 1.45; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+.j-key { color: #7dd3fc; }
+.j-num { color: #fde68a; }
+.j-bool { color: #fca5a5; }
+.j-null { color: #c4b5fd; }
+@media (max-width: 1200px) { .feed-layout { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
-<header>
-  <h1>RWCT Web Admin - SQLite Explorer</h1>
-</header>
-<main>
-  <section class="card">
-    <div class="row" style="justify-content:space-between; margin-bottom:10px;">
-      <h2>Feed nel DB</h2>
-      <button class="primary" onclick="reloadAll()">Aggiorna</button>
+<div id="app" class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-title">RWCT Web Admin</div>
+      <button class="collapse-btn" onclick="toggleSidebar()">☰</button>
     </div>
-    <div class="row" style="margin-bottom:10px;">
-      <input id="newFeedUrl" class="url" placeholder="https://example.com/jobs.rss">
-      <button onclick="addFeed()">Aggiungi feed</button>
-    </div>
-    <div class="monitor-box">
-      <details>
-        <summary><span class="small"><strong>Riepilogo pipeline</strong></span></summary>
-        <div id="overview" class="monitor-content badge-stack small"></div>
-      </details>
-    </div>
-    <div class="monitor-grid">
-      <div class="monitor-box">
-        <details>
-          <summary><span class="small"><strong>Code SQLite (tempo reale)</strong></span></summary>
-          <div class="monitor-content">
-            <div id="mosqMeta" class="small"></div>
-            <div id="queueList" class="queue-list"></div>
-          </div>
-        </details>
-      </div>
-      <div class="monitor-box">
-        <details>
-          <summary><span class="small"><strong>Analyzer attivi</strong></span></summary>
-          <div id="analyzerList" class="monitor-content analyzer-list small"></div>
-        </details>
-      </div>
-      <div class="monitor-box">
-        <div class="small"><strong>Ratio NEW/DISPATCHED (ultime 3h, 1m)</strong></div>
-        <div class="chart-legend">
-          <span><span class="dot new"></span> NEW/min</span>
-          <span><span class="dot disp"></span> DISPATCHED/min</span>
-          <span><span class="dot ratio"></span> Ratio</span>
-        </div>
-        <div class="chart-wrap">
-          <svg id="ratioChart" width="420" height="120" viewBox="0 0 420 120" preserveAspectRatio="none"></svg>
-        </div>
-      </div>
-    </div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>Feed</th><th>Stato</th><th>Items</th><th>Azioni</th></tr>
-        </thead>
-        <tbody id="feedsBody"></tbody>
-      </table>
-    </div>
-  </section>
+    <nav id="viewNav" class="view-nav"></nav>
+    <div class="sidebar-footer small">Nuove viste: aggiungi un elemento nel registry JS.</div>
+  </aside>
 
-  <section class="card">
-    <h2>Items per feed</h2>
-    <div id="selectedFeed" class="small" style="margin-bottom:10px;">Seleziona un feed per vedere gli items memorizzati.</div>
-    <div id="requeuePanel" class="requeue-panel">
-      <div class="requeue-head">
-        <div>
-          <strong>Requeue in corso</strong>
-          <div id="requeueMeta" class="small"></div>
+  <main class="content">
+    <div class="topbar card">
+      <h1 id="currentViewTitle" class="top-title">Feeds</h1>
+      <div class="row">
+        <button class="primary" onclick="reloadCurrentView()">Aggiorna vista</button>
+        <span id="lastRefresh" class="small"></span>
+      </div>
+    </div>
+
+    <div id="globalSummary" class="card row small"></div>
+
+    <div class="views">
+      <section id="view-feeds" class="view active">
+        <div class="feed-layout">
+          <div class="card">
+            <div class="row" style="justify-content:space-between;margin-bottom:8px;">
+              <strong>RSS Feeds</strong>
+              <span class="small">Seleziona feed per vedere gli item e agire</span>
+            </div>
+            <div class="row" style="margin-bottom:8px;">
+              <input id="newFeedUrl" class="url" placeholder="https://example.com/jobs.rss" style="flex:1;min-width:220px;">
+              <button onclick="addFeed()">Aggiungi</button>
+            </div>
+            <div class="table-wrap">
+              <table id="feedTable">
+                <thead><tr><th>Feed</th><th>Stato</th><th>Items</th><th>Azioni</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div id="selectedFeed" class="small" style="margin-bottom:8px;">Seleziona un feed per vedere gli items memorizzati.</div>
+            <div id="requeuePanel" class="requeue-panel">
+              <div class="row" style="justify-content:space-between;">
+                <div class="small"><strong>Requeue monitor</strong> <span id="requeueItemLabel" class="mono"></span></div>
+                <div id="requeueStatusPill" class="pill warn">PENDING</div>
+              </div>
+              <div id="requeueStatusText" class="small"><span class="spinner"></span>Richiesta inviata, in attesa pipeline...</div>
+              <div class="requeue-flow">
+                <span id="stepQueued" class="flow-step">NEW</span><span class="flow-link"></span>
+                <span id="stepAnalyzed" class="flow-step">ANALYZED</span><span class="flow-link"></span>
+                <span id="stepDispatched" class="flow-step">DISPATCHED</span>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table id="itemsTable">
+                <thead><tr><th>Quando</th><th>Titolo</th><th>Status</th><th>Queue</th><th>URL</th><th>Azioni</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
         </div>
-        <div id="requeueStatusPill" class="pill warn">PENDING</div>
-      </div>
-      <div id="requeueStatusText" class="small"><span class="spinner"></span>Richiesta inviata, in attesa pipeline...</div>
-      <div id="requeueError" class="small" style="color:#b91c1c; margin-top:4px;"></div>
-      <div class="requeue-flow">
-        <span id="flow-new" class="flow-step">NEW</span><span class="flow-link"></span>
-        <span id="flow-analyzed" class="flow-step">ANALYZED</span><span class="flow-link"></span>
-        <span id="flow-dispatched" class="flow-step">DISPATCHED</span>
-      </div>
+      </section>
+
+      <section id="view-board" class="view">
+        <div class="card kanban-shell">
+          <div class="row" style="justify-content:space-between;">
+            <div>
+              <strong>Pipeline Board</strong>
+              <span class="small">FIFO: in alto gli item che verranno prelevati prima.</span>
+            </div>
+            <div class="row">
+              <label class="small">Limit/lane</label>
+              <input id="boardLimit" value="120" style="width:80px;">
+              <button id="boardAutoBtn" onclick="toggleBoardAutoRefresh()">Auto-refresh: ON</button>
+              <button onclick="loadBoard()">Refresh now</button>
+            </div>
+          </div>
+          <div id="boardMeta" class="small"></div>
+          <div id="boardLanes" class="lanes"></div>
+        </div>
+      </section>
     </div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>Quando</th><th>Titolo</th><th>Status</th><th>Queue</th><th>URL</th><th>Hash</th><th>Azioni</th></tr>
-        </thead>
-        <tbody id="itemsBody"></tbody>
-      </table>
-    </div>
-  </section>
-</main>
+  </main>
+</div>
+
 <div id="jsonModalBackdrop" class="modal-backdrop" onclick="closeJSONModal(event)">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="jsonModalTitle">
+  <div class="modal">
     <div class="modal-head">
-      <div id="jsonModalTitle" class="modal-title">Processed version JSON</div>
+      <div>Versione analizzata JSON - <span id="jsonModalID" class="mono"></span></div>
       <button onclick="closeJSONModal()">Chiudi</button>
     </div>
     <pre id="jsonModalBody" class="code"></pre>
@@ -1568,369 +1830,377 @@ button.primary { background:#0f172a; color:#fff; border-color:#0f172a; }
 </div>
 
 <script>
-let currentFeed = '';
-let requeueInFlight = false;
+var state = {
+  currentView: 'feeds',
+  currentFeed: '',
+  sidebarCollapsed: false,
+  boardAutoRefresh: true,
+  boardTimer: null,
+  requeuePollTimer: null
+};
 
-async function api(path, opt={}) {
-  const res = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opt));
-  const txt = await res.text();
-  let data = {};
-  try { data = txt ? JSON.parse(txt) : {}; } catch (_) { data = {error: txt}; }
-  if (!res.ok) throw new Error(data.error || txt || ('HTTP ' + res.status));
-  return data;
+var VIEW_REGISTRY = [
+  { id: 'feeds', label: 'Feeds & Items', title: 'Feeds' },
+  { id: 'board', label: 'Pipeline Board', title: 'Pipeline Board' }
+];
+
+async function api(path, opt) {
+  var res = await fetch(path, opt || {});
+  if (!res.ok) {
+    var txt = await res.text();
+    var data = {};
+    try { data = JSON.parse(txt); } catch (_) {}
+    throw new Error(data.error || txt || ('HTTP ' + res.status));
+  }
+  return res.json();
+}
+
+function esc(v) {
+  return String(v == null ? '' : v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;");
 }
 
 function fmtDate(v) {
   if (!v) return '-';
-  return new Date(v).toLocaleString();
+  try { return new Date(v).toLocaleString(); } catch (_) { return String(v); }
 }
 
-function fmtDateExact(v) {
+function fmtRelative(v) {
   if (!v) return '-';
-  const d = new Date(v);
-  if (Number.isNaN(d.getTime())) return '-';
-  return d.toLocaleString('it-IT', { dateStyle: 'full', timeStyle: 'long' });
+  var t = new Date(v).getTime();
+  if (!Number.isFinite(t)) return fmtDate(v);
+  var d = Date.now() - t;
+  var a = Math.abs(d);
+  var s = Math.floor(a / 1000);
+  if (s < 60) return (d >= 0 ? s + 's fa' : 'tra ' + s + 's');
+  var m = Math.floor(s / 60);
+  if (m < 60) return (d >= 0 ? m + 'm fa' : 'tra ' + m + 'm');
+  var h = Math.floor(m / 60);
+  if (h < 24) return (d >= 0 ? h + 'h fa' : 'tra ' + h + 'h');
+  var g = Math.floor(h / 24);
+  return (d >= 0 ? g + 'g fa' : 'tra ' + g + 'g');
 }
 
-function fmtRelativeDate(v) {
-  if (!v) return '-';
-  const d = new Date(v);
-  if (Number.isNaN(d.getTime())) return '-';
-  const diffSec = Math.round((d.getTime() - Date.now()) / 1000);
-  const absSec = Math.abs(diffSec);
-  const rtf = new Intl.RelativeTimeFormat('it', { numeric: 'auto' });
-  if (absSec < 60) return rtf.format(diffSec, 'second');
-  const diffMin = Math.round(diffSec / 60);
-  if (Math.abs(diffMin) < 60) return rtf.format(diffMin, 'minute');
-  const diffHour = Math.round(diffMin / 60);
-  if (Math.abs(diffHour) < 24) return rtf.format(diffHour, 'hour');
-  const diffDay = Math.round(diffHour / 24);
-  return rtf.format(diffDay, 'day');
+function setLastRefresh() {
+  document.getElementById('lastRefresh').textContent = 'Ultimo refresh: ' + new Date().toLocaleTimeString();
 }
 
-function esc(v) {
-  return String(v || '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
-}
-
-function flowReset() {
-  for (const id of ['flow-new', 'flow-analyzed', 'flow-dispatched']) {
-    const el = document.getElementById(id);
-    if (el) el.className = 'flow-step';
-  }
-}
-
-function renderRequeueState(itemID, mode, status, err, updatedAt, active) {
-  const panel = document.getElementById('requeuePanel');
-  const meta = document.getElementById('requeueMeta');
-  const pill = document.getElementById('requeueStatusPill');
-  const text = document.getElementById('requeueStatusText');
-  const errorEl = document.getElementById('requeueError');
-  panel.style.display = 'block';
-  meta.textContent = 'item: ' + itemID + ' · mode: ' + mode + ' · aggiornato: ' + fmtDate(updatedAt);
-  errorEl.textContent = err || '';
-
-  flowReset();
-  const sNew = document.getElementById('flow-new');
-  const sAnalyzed = document.getElementById('flow-analyzed');
-  const sDispatched = document.getElementById('flow-dispatched');
-
-  if (status === 'NEW') {
-    sNew.className = 'flow-step active';
-    text.innerHTML = (active ? '<span class="spinner"></span>' : '') + 'Item in coda al reader/analyzer';
-    pill.className = 'pill warn';
-  } else if (status === 'ANALYZED') {
-    sNew.className = 'flow-step done';
-    sAnalyzed.className = 'flow-step active';
-    text.innerHTML = (active ? '<span class="spinner"></span>' : '') + 'Analisi completata, in attesa dispatch';
-    pill.className = 'pill warn';
-  } else if (status === 'DISPATCHED') {
-    sNew.className = 'flow-step done';
-    sAnalyzed.className = 'flow-step done';
-    sDispatched.className = 'flow-step done';
-    text.textContent = 'Pipeline completata: item inviato.';
-    pill.className = 'pill ok';
-  } else if (status === 'FAILED') {
-    sNew.className = 'flow-step fail';
-    sAnalyzed.className = 'flow-step fail';
-    sDispatched.className = 'flow-step fail';
-    text.textContent = 'Pipeline fallita.';
-    pill.className = 'pill off';
-  } else {
-    sNew.className = 'flow-step active';
-    text.innerHTML = (active ? '<span class="spinner"></span>' : '') + 'Stato corrente: ' + (status || 'sconosciuto');
-    pill.className = 'pill warn';
-  }
-  pill.textContent = status || 'PENDING';
-}
-
-function renderRatioChart(points) {
-  const svg = document.getElementById('ratioChart');
-  if (!svg) return;
-  const w = 420;
-  const h = 120;
-  const pad = 8;
-  if (!points || points.length === 0) {
-    svg.innerHTML = '';
-    return;
-  }
-  let maxCount = 1;
-  let maxRatio = 1;
-  for (const p of points) {
-    if ((p.new_count || 0) > maxCount) maxCount = p.new_count || 0;
-    if ((p.dispatched_count || 0) > maxCount) maxCount = p.dispatched_count || 0;
-    if (typeof p.ratio === 'number' && p.ratio > maxRatio) maxRatio = p.ratio;
-  }
-
-  const stepX = (w - pad*2) / Math.max(1, points.length-1);
-  let newPath = '';
-  let dispPath = '';
-  let ratioPath = '';
-  points.forEach((p, i) => {
-    const x = pad + i*stepX;
-    const yNew = h - pad - ((p.new_count || 0) / maxCount) * (h - pad*2);
-    const yDisp = h - pad - ((p.dispatched_count || 0) / maxCount) * (h - pad*2);
-    const ratioVal = typeof p.ratio === 'number' ? p.ratio : 0;
-    const yRatio = h - pad - (ratioVal / maxRatio) * (h - pad*2);
-    newPath += (i === 0 ? 'M' : 'L') + x + ' ' + yNew + ' ';
-    dispPath += (i === 0 ? 'M' : 'L') + x + ' ' + yDisp + ' ';
-    ratioPath += (i === 0 ? 'M' : 'L') + x + ' ' + yRatio + ' ';
+function renderViewMenu() {
+  var nav = document.getElementById('viewNav');
+  nav.innerHTML = '';
+  VIEW_REGISTRY.forEach(function(v){
+    var b = document.createElement('button');
+    b.className = 'view-btn' + (state.currentView === v.id ? ' active' : '');
+    b.innerHTML = '<span class="view-label">' + esc(v.label) + '</span>';
+    b.onclick = function(){ switchView(v.id); };
+    nav.appendChild(b);
   });
-
-  svg.innerHTML =
-    '<line x1="' + pad + '" y1="' + (h-pad) + '" x2="' + (w-pad) + '" y2="' + (h-pad) + '" stroke="#e2e8f0" stroke-width="1" />' +
-    '<path d="' + newPath + '" fill="none" stroke="#0284c7" stroke-width="1.8" />' +
-    '<path d="' + dispPath + '" fill="none" stroke="#16a34a" stroke-width="1.8" />' +
-    '<path d="' + ratioPath + '" fill="none" stroke="#9333ea" stroke-width="1.3" stroke-dasharray="3 2" />';
 }
 
-async function loadQueueMonitor() {
-  const data = await api('/api/monitor/queues');
-  const mosqMeta = document.getElementById('mosqMeta');
-  const list = document.getElementById('queueList');
-  const p = data.pipeline || {};
-  const rawBlocked = p.consumer_blocked_raw ? ' <span class="pill off">RAW blocked?</span>' : '';
-  const analyzedBlocked = p.consumer_blocked_analyzed ? ' <span class="pill off">ANALYZED blocked?</span>' : '';
-  mosqMeta.innerHTML =
-    'Dispatched total: <span class="mono">' + (p.dispatched_total || 0) + '</span>' +
-    ' · new(5m): <span class="mono">' + (p.new_last_5m || 0) + '</span>' +
-    ' · dispatched(5m): <span class="mono">' + (p.dispatched_last_5m || 0) + '</span>' +
-    '<br>Stuck>10m NEW: <span class="mono">' + (p.stuck_new_10m || 0) + '</span>' +
-    ' · Stuck>10m ANALYZED: <span class="mono">' + (p.stuck_analyzed_10m || 0) + '</span>' +
-    rawBlocked + analyzedBlocked;
-
-  const queues = data.queues || [];
-  list.innerHTML = queues.map(q =>
-    '<div class="queue-row"><span><strong>' + q.name + '</strong> <span class="small mono">' + q.topic + '</span></span>' +
-    '<span class="pill">' + q.queued + '</span></div>'
-  ).join('');
-
-  renderRatioChart((data.ratio_window && data.ratio_window.points) || []);
+function toggleSidebar() {
+  state.sidebarCollapsed = !state.sidebarCollapsed;
+  document.getElementById('app').classList.toggle('sidebar-collapsed', state.sidebarCollapsed);
 }
 
-async function loadOverview() {
-  const o = await api('/api/db/overview');
-  const el = document.getElementById('overview');
-  el.innerHTML =
-    '<span class="pill ok">Feeds ON: ' + o.feeds_enabled + '</span>' +
-    '<span class="pill off">Feeds OFF: ' + o.feeds_disabled + '</span>' +
-    '<span class="pill">NEW: ' + o.pending_items + '</span>' +
-    '<span class="pill">DISPATCHED: ' + o.processed_items + '</span>' +
-    '<span class="pill">ANALYZED: ' + o.analyzed_items + '</span>';
+async function switchView(id) {
+  state.currentView = id;
+  VIEW_REGISTRY.forEach(function(v){
+    var el = document.getElementById('view-' + v.id);
+    if (el) el.classList.toggle('active', v.id === id);
+  });
+  renderViewMenu();
+  var selected = VIEW_REGISTRY.find(function(v){ return v.id === id; });
+  document.getElementById('currentViewTitle').textContent = selected ? selected.title : id;
+  if (id === 'board') {
+    await loadBoard();
+    startBoardAutoRefresh();
+  } else {
+    stopBoardAutoRefresh();
+    await loadFeedsView();
+  }
+  setLastRefresh();
 }
 
-async function loadAnalyzerRuntime() {
-  const data = await api('/api/runtime/analyzers');
-  const list = document.getElementById('analyzerList');
-  const analyzers = data.analyzers || [];
-  list.innerHTML = analyzers.map(a =>
-    '<div class="analyzer-card">' +
-      '<div class="analyzer-head">' +
-        '<div><strong>' + esc(a.name || 'job-analyzer') + '</strong><div class="small mono">' + esc(a.model || '-') + '</div></div>' +
-        '<span class="pill ' + (a.thinking_enabled ? 'ok' : 'warn') + '">thinking: ' + (a.thinking_enabled ? 'on' : 'off') + '</span>' +
-      '</div>' +
-      '<div class="badge-stack" style="margin-bottom:8px;">' +
-        '<span class="pill">max_tokens: ' + (a.max_tokens || 0) + '</span>' +
-        '<span class="pill">timeout: ' + esc(a.timeout || '-') + '</span>' +
-        '<span class="pill">max_jobs/min: ' + (a.max_jobs_per_min || 0) + '</span>' +
-        '<span class="pill">workers: ' + (a.max_concurrency || 0) + '</span>' +
-      '</div>' +
-      '<div class="analyzer-meta">' +
-        '<div><strong>Endpoint</strong><br><span class="mono">' + esc(a.endpoint || '-') + '</span></div>' +
-        '<div><strong>Lease</strong><br><span class="mono">' + esc(a.lease_duration || '-') + '</span></div>' +
-        '<div><strong>Poll interval</strong><br><span class="mono">' + esc(a.queue_poll_interval || '-') + '</span></div>' +
-        '<div><strong>Profile</strong><br><span class="mono">env-configured</span></div>' +
-      '</div>' +
-    '</div>'
-  ).join('');
+async function loadGlobalSummary() {
+  var overview = await api('/api/db/overview');
+  var queues = await api('/api/monitor/queues');
+  var q = queues.queues || [];
+  var qMap = {};
+  q.forEach(function(x){ qMap[x.name] = Number(x.queued || 0); });
+  var p = queues.pipeline || {};
+  document.getElementById('globalSummary').innerHTML = ''
+    + '<span class="pill">feeds on: ' + Number(overview.feeds_enabled || 0) + '</span>'
+    + '<span class="pill">feeds off: ' + Number(overview.feeds_disabled || 0) + '</span>'
+    + '<span class="pill">raw_backlog: ' + (qMap.raw_backlog || 0) + '</span>'
+    + '<span class="pill">raw_inflight: ' + (qMap.raw_inflight || 0) + '</span>'
+    + '<span class="pill">analyzed_backlog: ' + (qMap.analyzed_backlog || 0) + '</span>'
+    + '<span class="pill">analyzed_inflight: ' + (qMap.analyzed_inflight || 0) + '</span>'
+    + '<span class="pill">failed: ' + (qMap.failed || 0) + '</span>'
+    + '<span class="pill">dispatch/5m: ' + Number(p.dispatched_last_5m || 0) + '</span>';
 }
 
 async function loadFeeds() {
-  const feeds = await api('/api/db/feeds');
-  const body = document.getElementById('feedsBody');
-  body.innerHTML = '';
+  var feeds = await api('/api/db/feeds');
+  var tbody = document.querySelector('#feedTable tbody');
+  tbody.innerHTML = '';
+  feeds.forEach(function(f){
+    var tr = document.createElement('tr');
+    if (f.url === state.currentFeed) tr.classList.add('selected');
+    tr.innerHTML = ''
+      + '<td class="url"><div><strong>' + esc(f.source_label || f.url) + '</strong></div><div class="small mono">' + esc(f.url) + '</div></td>'
+      + '<td><span class="pill ' + (f.enabled ? (f.health_status === 'broken' ? 'warn':'ok') : 'off') + '">' + esc(f.health_status || (f.enabled ? 'ok' : 'disabled')) + '</span><div class="small">' + esc(f.health_reason || '') + '</div></td>'
+      + '<td>' + Number(f.items_count || 0) + '</td>'
+      + '<td><div class="row">'
+      + '<button class="tiny" onclick="event.stopPropagation();toggleFeed(&quot;' + encodeURIComponent(f.url) + '&quot;,' + (!f.enabled) + ')">' + (f.enabled ? 'Disabilita' : 'Abilita') + '</button>'
+      + '<button class="tiny" onclick="event.stopPropagation();forcePollFeed(&quot;' + encodeURIComponent(f.url) + '&quot;)">Poll now</button>'
+      + '<button class="tiny" onclick="event.stopPropagation();removeFeed(&quot;' + encodeURIComponent(f.url) + '&quot;)">Rimuovi</button>'
+      + '</div></td>';
+    tr.onclick = function(){ selectFeed(f.url, f.source_label || f.url, f.items_count || 0); };
+    tbody.appendChild(tr);
+  });
+}
 
-  for (const f of feeds) {
-    const tr = document.createElement('tr');
-    if (f.url === currentFeed) tr.classList.add('selected');
-    const enabledPill = f.enabled
-      ? '<span class="pill ok">enabled</span>'
-      : '<span class="pill off">disabled</span>';
-    const health = f.health_status || (f.enabled ? 'ok' : 'disabled');
-    const healthPillClass = health === 'ok' ? 'ok' : (health === 'broken' ? 'off' : 'warn');
-    const healthPillLabel = health === 'ok' ? 'health: ok' : (health === 'broken' ? 'health: rotto' : 'health: n/a');
-    const refresh = f.last_refresh_at
-      ? '<div class="small" title="' + esc(fmtDateExact(f.last_refresh_at)) + '">ultimo refresh ' + fmtRelativeDate(f.last_refresh_at) + '</div>'
-      : '<div class="small">ultimo refresh: mai</div>';
-    const down = f.down_until ? ('<div class="small">down until ' + fmtDate(f.down_until) + '</div>') : '';
-    const reason = f.health_reason ? ('<div class="small">' + esc(f.health_reason) + '</div>') : '';
-    const toggleLabel = f.enabled ? 'Disabilita' : 'Abilita';
-    tr.innerHTML =
-      '<td class="url"><div>' + f.url + '</div><div class="small">label: ' + f.source_label + '</div></td>' +
-      '<td>' + enabledPill + ' <span class="pill ' + healthPillClass + '">' + healthPillLabel + '</span>' + refresh + down + reason + '</td>' +
-      '<td>' + f.items_count + '</td>' +
-      '<td class="row"><button onclick="toggleFeed(\'' + encodeURIComponent(f.url) + '\',' + (!f.enabled) + '); event.stopPropagation();">' + toggleLabel + '</button><button onclick="forcePollFeed(\'' + encodeURIComponent(f.url) + '\'); event.stopPropagation();">Forza poll</button><button onclick="removeFeed(\'' + encodeURIComponent(f.url) + '\'); event.stopPropagation();">Rimuovi</button></td>';
-    tr.onclick = () => selectFeed(f.url, f.source_label, f.items_count);
-    body.appendChild(tr);
+async function selectFeed(url, label, count) {
+  state.currentFeed = url;
+  await loadFeeds();
+  var data = await api('/api/db/feed-items?feed_url=' + encodeURIComponent(url) + '&limit=220');
+  var items = data.items || [];
+  document.getElementById('selectedFeed').innerHTML = '<strong>' + esc(label) + '</strong> <span class="small">(' + esc(url) + ', items: ' + Number(count || items.length) + ')</span>';
+  var tbody = document.querySelector('#itemsTable tbody');
+  tbody.innerHTML = '';
+  items.forEach(function(it){
+    var tr = document.createElement('tr');
+    tr.innerHTML = ''
+      + '<td title="' + esc(fmtDate(it.created_at)) + '">' + esc(fmtRelative(it.created_at)) + '</td>'
+      + '<td><strong>' + esc(it.title || '') + '</strong></td>'
+      + '<td><span class="pill">' + esc(it.status || '-') + '</span></td>'
+      + '<td><span class="pill">' + esc(it.queue_state || '-') + '</span></td>'
+      + '<td class="url"><a href="' + esc(it.url || '#') + '" target="_blank" rel="noreferrer">open</a></td>'
+      + '<td><div class="row">'
+      + '<button class="tiny" onclick="requeueItem(&quot;' + encodeURIComponent(it.id) + '&quot;)">Requeue</button>'
+      + '<button class="tiny" onclick="deleteItem(&quot;' + encodeURIComponent(it.id) + '&quot;)">Delete</button>'
+      + '<button class="tiny" onclick="showAnalyzedVersion(&quot;' + encodeURIComponent(it.id) + '&quot;)">View analyzed</button>'
+      + '</div></td>';
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadFeedsView() {
+  await loadGlobalSummary();
+  await loadFeeds();
+  if (state.currentFeed) {
+    var selected = state.currentFeed;
+    state.currentFeed = '';
+    await selectFeed(selected, selected, 0);
   }
 }
 
 async function addFeed() {
-  const input = document.getElementById('newFeedUrl');
-  const url = (input.value || '').trim();
+  var input = document.getElementById('newFeedUrl');
+  var url = (input.value || '').trim();
   if (!url) return;
-  await api('/api/db/feeds', {
-    method: 'POST',
-    body: JSON.stringify({url})
-  });
+  await api('/api/db/feeds', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: url}) });
   input.value = '';
-  await reloadAll();
+  await loadFeedsView();
 }
 
 async function toggleFeed(encodedUrl, enabled) {
-  const url = decodeURIComponent(encodedUrl);
-  await api('/api/db/feeds/toggle', {
-    method: 'POST',
-    body: JSON.stringify({url, enabled})
-  });
+  var url = decodeURIComponent(encodedUrl);
+  await api('/api/db/feeds/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: url, enabled: enabled}) });
   await loadFeeds();
-  await loadOverview();
 }
 
 async function forcePollFeed(encodedUrl) {
-  const url = decodeURIComponent(encodedUrl);
-  await api('/api/db/feeds/poll', {
-    method: 'POST',
-    body: JSON.stringify({url})
-  });
-  await reloadAll();
+  var url = decodeURIComponent(encodedUrl);
+  await api('/api/db/feeds/poll', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: url}) });
+  await loadGlobalSummary();
 }
 
 async function removeFeed(encodedUrl) {
-  const url = decodeURIComponent(encodedUrl);
-  if (!confirm('Rimuovere definitivamente il feed dal DB?\\n' + url)) return;
+  var url = decodeURIComponent(encodedUrl);
+  if (!confirm('Rimuovere feed?\\n' + url)) return;
   await api('/api/db/feeds?url=' + encodeURIComponent(url), { method: 'DELETE' });
-  if (currentFeed === url) {
-    currentFeed = '';
-    document.getElementById('selectedFeed').innerHTML = 'Seleziona un feed per vedere gli items memorizzati.';
-    document.getElementById('itemsBody').innerHTML = '';
+  if (state.currentFeed === url) {
+    state.currentFeed = '';
+    document.querySelector('#itemsTable tbody').innerHTML = '';
+    document.getElementById('selectedFeed').textContent = 'Seleziona un feed per vedere gli items memorizzati.';
+    document.getElementById('requeuePanel').style.display = 'none';
   }
-  await reloadAll();
+  await loadFeedsView();
 }
 
-async function selectFeed(url, label, count) {
-  currentFeed = url;
-  await loadFeeds();
+function laneColor(name) {
+  if (name === 'failed' || name === 'anomalies') return 'off';
+  if (name === 'raw_inflight' || name === 'analyzed_inflight') return 'warn';
+  return 'ok';
+}
 
-  const data = await api('/api/db/feed-items?feed_url=' + encodeURIComponent(url) + '&limit=200');
-  const effectiveLabel = data.source_label || label || '-';
-  const effectiveCount = (typeof count === 'number' && count > 0) ? count : ((data.items || []).length || 0);
-  document.getElementById('selectedFeed').innerHTML =
-    '<div><strong>' + url + '</strong></div><div class="small">source_label: ' + effectiveLabel + ' · db items: ' + effectiveCount + '</div>';
-  const body = document.getElementById('itemsBody');
-  body.innerHTML = '';
-  for (const it of (data.items || [])) {
-    const tr = document.createElement('tr');
-    const title = it.title || '(senza titolo)';
-    tr.innerHTML =
-      '<td>' + fmtDate(it.created_at) + '</td>' +
-      '<td>' + title + '</td>' +
-      '<td>' + (it.status || '-') + '</td>' +
-      '<td><span class="pill">' + (it.queue_state || '-') + '</span></td>' +
-      '<td class="url"><a href="' + (it.url || '#') + '" target="_blank" rel="noreferrer">' + (it.url || '-') + '</a></td>' +
-      '<td class="url">' + (it.item_hash || '-') + '</td>' +
-      '<td class="row">' +
-        '<button onclick="requeueItem(\'' + encodeURIComponent(it.id) + '\')"' + (it.has_analyzed_version ? '' : ' disabled title="Serve una processed version"') + '>Requeue</button>' +
-        '<button onclick="showAnalyzedVersion(\'' + encodeURIComponent(it.id) + '\')"' + (it.has_analyzed_version ? '' : ' disabled') + '>Processed version</button>' +
-        '<button onclick="deleteItem(\'' + encodeURIComponent(it.id) + '\')">Elimina</button>' +
-      '</td>';
-    body.appendChild(tr);
+async function loadBoard() {
+  var limit = Number((document.getElementById('boardLimit').value || '120').trim());
+  if (!Number.isFinite(limit) || limit <= 0) limit = 120;
+  var data = await api('/api/monitor/board?limit_per_lane=' + encodeURIComponent(String(limit)));
+  var lanes = data.lanes || [];
+  var root = document.getElementById('boardLanes');
+  var total = 0;
+  lanes.forEach(function(l){ total += Number(l.count || 0); });
+  document.getElementById('boardMeta').innerHTML = '<span class="pill">items visualizzati: ' + total + '</span><span class="pill">limit/lane: ' + Number(data.limit_per_lane || limit) + '</span>';
+
+  root.innerHTML = lanes.map(function(lane){
+    var cards = (lane.items || []).map(function(it){
+      var errBlock = it.last_error ? ('<div class="small" style="color:#b42318;"><strong>err:</strong> ' + esc(it.last_error) + '</div>') : '';
+      return ''
+        + '<article class="item-card">'
+        + '  <div class="item-title">' + esc(it.title || '(no title)') + '</div>'
+        + '  <div class="item-meta">'
+        + '    <div><span class="pill">' + esc(it.status || '-') + '</span> <span class="pill">' + esc(it.queue_state || '-') + '</span></div>'
+        + '    <div>feed: <span class="mono">' + esc(it.source_label || '-') + '</span></div>'
+        + '    <div>id: <span class="mono">' + esc(it.id || '') + '</span></div>'
+        + '    <div>created: ' + esc(fmtDate(it.created_at)) + '</div>'
+        + '  </div>'
+        + errBlock
+        + '  <div class="item-actions">'
+        + '    <a href="' + esc(it.url || '#') + '" target="_blank" rel="noreferrer"><button class="tiny">Open</button></a>'
+        + '    <button class="tiny" onclick="requeueItem(&quot;' + encodeURIComponent(it.id) + '&quot;)">Requeue</button>'
+        + '    <button class="tiny" onclick="deleteItem(&quot;' + encodeURIComponent(it.id) + '&quot;)">Delete</button>'
+        + '    <button class="tiny" onclick="showAnalyzedVersion(&quot;' + encodeURIComponent(it.id) + '&quot;)">View analyzed</button>'
+        + '  </div>'
+        + '</article>';
+    }).join('');
+    if (!cards) cards = '<div class="small muted">Nessun item in questa lane.</div>';
+    return ''
+      + '<section class="lane">'
+      + '  <div class="lane-head">'
+      + '    <div class="lane-title">' + esc(lane.title || lane.name) + '</div>'
+      + '    <span class="pill ' + laneColor(lane.name) + '">' + Number(lane.count || 0) + '</span>'
+      + '  </div>'
+      + '  <div class="lane-items">' + cards + '</div>'
+      + '</section>';
+  }).join('');
+}
+
+function startBoardAutoRefresh() {
+  stopBoardAutoRefresh();
+  if (!state.boardAutoRefresh) return;
+  state.boardTimer = setInterval(function(){
+    if (state.currentView === 'board') {
+      loadBoard().then(setLastRefresh).catch(showError);
+      loadGlobalSummary().catch(showError);
+    }
+  }, 5000);
+}
+
+function stopBoardAutoRefresh() {
+  if (state.boardTimer) {
+    clearInterval(state.boardTimer);
+    state.boardTimer = null;
+  }
+}
+
+function toggleBoardAutoRefresh() {
+  state.boardAutoRefresh = !state.boardAutoRefresh;
+  document.getElementById('boardAutoBtn').textContent = 'Auto-refresh: ' + (state.boardAutoRefresh ? 'ON' : 'OFF');
+  if (state.boardAutoRefresh) startBoardAutoRefresh(); else stopBoardAutoRefresh();
+}
+
+function flowReset() {
+  ['stepQueued','stepAnalyzed','stepDispatched'].forEach(function(id){
+    var el = document.getElementById(id);
+    el.classList.remove('active','done','fail');
+  });
+}
+
+function renderRequeueState(itemID, status, err, updatedAt, active) {
+  var panel = document.getElementById('requeuePanel');
+  var label = document.getElementById('requeueItemLabel');
+  var pill = document.getElementById('requeueStatusPill');
+  var text = document.getElementById('requeueStatusText');
+  panel.style.display = 'block';
+  label.textContent = itemID || '';
+  flowReset();
+  var sQ = document.getElementById('stepQueued');
+  var sA = document.getElementById('stepAnalyzed');
+  var sD = document.getElementById('stepDispatched');
+
+  if (status === 'NEW') {
+    sQ.classList.add('active');
+    pill.className = 'pill warn';
+    text.innerHTML = (active ? '<span class="spinner"></span>' : '') + 'In coda raw. Ultimo update: ' + esc(fmtDate(updatedAt));
+  } else if (status === 'ANALYZED') {
+    sQ.classList.add('done');
+    sA.classList.add('active');
+    pill.className = 'pill ok';
+    text.innerHTML = (active ? '<span class="spinner"></span>' : '') + 'Analizzato e in coda dispatch. Ultimo update: ' + esc(fmtDate(updatedAt));
+  } else if (status === 'DISPATCHED') {
+    sQ.classList.add('done'); sA.classList.add('done'); sD.classList.add('done');
+    pill.className = 'pill ok';
+    text.textContent = 'Dispatch completato alle ' + fmtDate(updatedAt);
+  } else if (status === 'FAILED') {
+    sQ.classList.add('done'); sA.classList.add('fail');
+    pill.className = 'pill off';
+    text.textContent = 'Errore: ' + (err || 'unknown');
+  } else {
+    sQ.classList.add('active');
+    pill.className = 'pill warn';
+    text.innerHTML = (active ? '<span class="spinner"></span>' : '') + 'Stato corrente: ' + esc(status || 'sconosciuto');
+  }
+  pill.textContent = status || 'PENDING';
+  if (!active && state.requeuePollTimer) {
+    clearInterval(state.requeuePollTimer);
+    state.requeuePollTimer = null;
   }
 }
 
 async function requeueItem(encodedId) {
-  if (requeueInFlight) return;
-  requeueInFlight = true;
-  const id = decodeURIComponent(encodedId);
-  renderRequeueState(id, 'pending', 'NEW', '', new Date().toISOString(), true);
+  var id = decodeURIComponent(encodedId);
+  if (state.requeuePollTimer) {
+    clearInterval(state.requeuePollTimer);
+    state.requeuePollTimer = null;
+  }
+  renderRequeueState(id, 'NEW', '', new Date().toISOString(), true);
   try {
-    const res = await api('/api/db/items/requeue', { method: 'POST', body: JSON.stringify({id}) });
-    const mode = res.mode || 'raw';
-    const started = Date.now();
-    while (Date.now()-started < 90000) {
-      const st = await api('/api/db/items/status?id=' + encodeURIComponent(id));
-      const active = st.status !== 'DISPATCHED' && st.status !== 'FAILED';
-      renderRequeueState(id, mode, st.status, st.last_error || '', st.updated_at, active);
-      if (!active) break;
-      await new Promise(r => setTimeout(r, 1200));
-    }
+    await api('/api/db/items/requeue', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: id}) });
+    state.requeuePollTimer = setInterval(async function(){
+      var st = await api('/api/db/items/status?id=' + encodeURIComponent(id));
+      var active = st.status !== 'DISPATCHED' && st.status !== 'FAILED';
+      renderRequeueState(id, st.status, st.last_error || '', st.updated_at, active);
+    }, 1500);
   } catch (err) {
-    renderRequeueState(id, 'error', 'FAILED', err.message || String(err), new Date().toISOString(), false);
-    throw err;
+    renderRequeueState(id, 'FAILED', err.message || String(err), new Date().toISOString(), false);
   } finally {
-    requeueInFlight = false;
-    await reloadAll();
+    await reloadCurrentView();
   }
 }
 
 async function deleteItem(encodedId) {
-  const id = decodeURIComponent(encodedId);
-  if (!confirm('Eliminare item dal DB?\\n' + id)) return;
+  var id = decodeURIComponent(encodedId);
+  if (!confirm('Eliminare item ' + id + '?')) return;
   await api('/api/db/items?id=' + encodeURIComponent(id), { method: 'DELETE' });
-  await reloadAll();
+  await reloadCurrentView();
 }
 
 async function showAnalyzedVersion(encodedId) {
-  const id = decodeURIComponent(encodedId);
-  const res = await api('/api/db/items/analyzed?id=' + encodeURIComponent(id));
-  if (!res.analyzed_payload_json) {
-    alert('Nessuna processed version disponibile per questo item.');
-    return;
-  }
-  showJSONModal(id, res.analyzed_payload_json);
+  var id = decodeURIComponent(encodedId);
+  var data = await api('/api/db/items/analyzed?id=' + encodeURIComponent(id));
+  showJSONModal(id, data.analyzed_payload_json || '');
 }
 
 function syntaxHighlightJSON(v) {
-  const escText = esc(v);
-  return escText
-    .replace(/\"([^\"\\]|\\.)*\"(?=\\s*:)/g, '<span class="j-key">$&</span>')
-    .replace(/(:\\s*)\"([^\"\\]|\\.)*\"/g, '$1<span class="j-str">"$2"</span>')
-    .replace(/\\b(true|false)\\b/g, '<span class="j-bool">$1</span>')
-    .replace(/\\bnull\\b/g, '<span class="j-null">null</span>')
-    .replace(/-?\\b\\d+(?:\\.\\d+)?(?:[eE][+\\-]?\\d+)?\\b/g, '<span class="j-num">$&</span>');
+  var s = JSON.stringify(v, null, 2);
+  return esc(s).replace(/(&quot;[^&]*&quot;)(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?/g, function(m, s1, s2){
+    if (s1) return '<span class="j-key">' + s1 + '</span>' + (s2 || '');
+    if (/^(true|false)$/.test(m)) return '<span class="j-bool">' + m + '</span>';
+    if (/^null$/.test(m)) return '<span class="j-null">' + m + '</span>';
+    return '<span class="j-num">' + m + '</span>';
+  });
 }
 
 function showJSONModal(id, rawPayload) {
-  let formatted = rawPayload;
-  try {
-    formatted = JSON.stringify(JSON.parse(rawPayload), null, 2);
-  } catch (_) {}
-  document.getElementById('jsonModalTitle').textContent = 'Processed version JSON · ' + id;
-  document.getElementById('jsonModalBody').innerHTML = syntaxHighlightJSON(formatted);
-  document.getElementById('jsonModalBackdrop').style.display = 'flex';
+  var bd = document.getElementById('jsonModalBackdrop');
+  var body = document.getElementById('jsonModalBody');
+  document.getElementById('jsonModalID').textContent = id || '';
+  var parsed = null;
+  try { parsed = JSON.parse(rawPayload || '{}'); } catch (_) {}
+  body.innerHTML = parsed ? syntaxHighlightJSON(parsed) : esc(rawPayload || '');
+  bd.style.display = 'flex';
 }
 
 function closeJSONModal(ev) {
@@ -1938,46 +2208,29 @@ function closeJSONModal(ev) {
   document.getElementById('jsonModalBackdrop').style.display = 'none';
 }
 
-async function reloadAll() {
-  await loadOverview();
-  await loadAnalyzerRuntime();
-  await loadQueueMonitor();
-  await loadFeeds();
-  if (currentFeed) {
-    const selected = currentFeed;
-    currentFeed = '';
-    await selectFeed(selected, '', 0);
-  }
+function showError(err) {
+  alert(err && err.message ? err.message : String(err));
 }
 
-reloadAll().catch(err => {
-  console.error(err);
-  alert(err.message || String(err));
-});
+async function reloadCurrentView() {
+  if (state.currentView === 'board') {
+    await loadGlobalSummary();
+    await loadBoard();
+  } else {
+    await loadFeedsView();
+  }
+  setLastRefresh();
+}
 
-setInterval(() => {
-  loadQueueMonitor().catch(err => console.error(err));
-}, 5000);
-
-setInterval(() => {
-  loadAnalyzerRuntime().catch(err => console.error(err));
-}, 30000);
-
-setInterval(() => {
-  loadFeeds().catch(err => console.error(err));
-}, 30000);
+(async function init(){
+  try {
+    renderViewMenu();
+    await loadFeedsView();
+    setLastRefresh();
+  } catch (err) {
+    showError(err);
+  }
+})();
 </script>
 </body>
 </html>`
-
-func MustEnvDuration(key, def string) time.Duration {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		v = def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		panic(fmt.Sprintf("invalid duration for %s: %v", key, err))
-	}
-	return d
-}

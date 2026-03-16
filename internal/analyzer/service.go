@@ -72,6 +72,7 @@ type Config struct {
 	LLMTimeoutPer256Tokens time.Duration
 	LLMMaxTokens           int
 	LLMThinking            bool
+	LLMStrictJSON          bool
 	PromptTemplate         string
 	CompactPromptTemplate  string
 	SourceExtractor        string
@@ -859,6 +860,60 @@ func stripMarkdownCodeFence(v string) string {
 	return strings.TrimSpace(v)
 }
 
+func analyzedJobJSONSchema() map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"required": []string{
+			"job_category", "role", "company", "seniority", "location", "remote_type",
+			"tech_stack", "tags", "contract_type", "salary", "language", "summary_it", "confidence",
+		},
+		"properties": map[string]any{
+			"job_category": map[string]any{
+				"type": "string",
+				"enum": allowedJobCategories,
+			},
+			"role":          map[string]any{"type": "string"},
+			"company":       map[string]any{"type": "string"},
+			"seniority":     map[string]any{"type": "string"},
+			"location":      map[string]any{"type": "string"},
+			"remote_type":   map[string]any{"type": "string"},
+			"contract_type": map[string]any{"type": "string"},
+			"salary":        map[string]any{"type": "string"},
+			"language":      map[string]any{"type": "string"},
+			"summary_it": map[string]any{
+				"type":      "string",
+				"maxLength": 220,
+			},
+			"tech_stack": map[string]any{
+				"type":        "array",
+				"minItems":    0,
+				"maxItems":    8,
+				"uniqueItems": true,
+				"items": map[string]any{
+					"type":      "string",
+					"maxLength": 32,
+				},
+			},
+			"tags": map[string]any{
+				"type":        "array",
+				"minItems":    0,
+				"maxItems":    6,
+				"uniqueItems": true,
+				"items": map[string]any{
+					"type":      "string",
+					"maxLength": 24,
+				},
+			},
+			"confidence": map[string]any{
+				"type":    "number",
+				"minimum": 0,
+				"maximum": 1,
+			},
+		},
+	}
+}
+
 func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (string, error) {
 	ctx, span := s.tracerForUse().Start(ctx, "analyzer.call_llm",
 		trace.WithAttributes(
@@ -886,6 +941,15 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 	}
 	if s.cfg.LLMThinking {
 		reqBody["enable_thinking"] = true
+	}
+	if s.cfg.LLMStrictJSON {
+		schema := analyzedJobJSONSchema()
+		reqBody["response_format"] = map[string]any{
+			"type":   "json_schema",
+			"schema": schema,
+		}
+		// Fallback for llama.cpp implementations that map json_schema directly to grammar-based sampling.
+		reqBody["json_schema"] = schema
 	}
 	body, _ := json.Marshal(reqBody)
 

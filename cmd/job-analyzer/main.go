@@ -71,6 +71,7 @@ func main() {
 		LLMTimeoutPer256Tokens: analyzer.MustEnvDuration("LLM_TIMEOUT_PER_256_TOKENS", "20s"),
 		LLMMaxTokens:           getenvInt("LLM_MAX_TOKENS", 512),
 		LLMThinking:            getenvBool("LLM_THINKING_ENABLED", false),
+		LLMStrictJSON:          getenvBool("ANALYZER_LLM_STRICT_JSON", true),
 		PromptTemplate:         getenv("ANALYZER_PROMPT_TEMPLATE", ""),
 		CompactPromptTemplate:  getenv("ANALYZER_COMPACT_PROMPT_TEMPLATE", ""),
 		SourceExtractor:        getenv("ANALYZER_SOURCE_EXTRACTOR", "basic"),

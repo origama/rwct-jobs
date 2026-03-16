@@ -68,6 +68,7 @@ Endpoint observability locale (solo profilo `obs`):
 - `LLM_TIMEOUT_PER_1K_CHARS`: budget extra per prompt lunghi (ogni ~1000 caratteri).
 - `LLM_TIMEOUT_PER_256_TOKENS`: budget extra per risposte lunghe (ogni 256 `max_tokens` richiesti).
 - `LLM_THINKING_ENABLED=true|false`: inoltra `enable_thinking` alla `/v1/chat/completions` quando supportato.
+- `ANALYZER_LLM_STRICT_JSON=true|false` (default `true`): forza structured output con JSON Schema (`response_format`/`json_schema`) verso endpoint OpenAI-compatible (es. `llama.cpp`).
 - `ANALYZER_PROMPT_TEMPLATE`: prompt principale custom (Go `text/template`) con variabili `AllowedCategories`, `Title`, `URL`, `Description`, `SourcePageText`, `LinksCSV`, `ImagesCSV`.
 - `ANALYZER_COMPACT_PROMPT_TEMPLATE`: prompt fallback compatto custom con le stesse variabili.
 - `ANALYZER_MAX_PARALLEL_JOBS` (default `1`): massimo numero di job in parallelo per singolo processo `job-analyzer` (attualmente forzato a `1` in strict sequential mode).
@@ -78,6 +79,7 @@ Endpoint observability locale (solo profilo `obs`):
 - `ANALYZER_SCRAPLING_MAX_CHARS` (default `10000`): clamp testo estratto da Scrapling.
 - `ANALYZER_MAX_DELIVERY_ATTEMPTS` (default `3`): soglia anti-poison item su `analyzer_queue`.
 - `LLM_PARALLEL_THREADS` (default `-1`): numero thread CPU per `llama.cpp` (`-t`, auto-detect quando `-1`).
+- `LLAMA_ENABLE_METRICS=true|false` (default `true`): abilita endpoint Prometheus `/metrics` di `llama.cpp` (`--metrics`).
 
 ## OpenTelemetry / Observability
 
@@ -95,6 +97,7 @@ Forwarding Grafana Cloud (collector):
   - `GRAFANA_INSTANCE_ID`
   - `GRAFANA_TOKEN`
 - metriche host abilitate via receiver `hostmetrics` (CPU, memoria, disco/filesystem, rete, paging, process count).
+- metriche `llama.cpp` collezionate via receiver Prometheus del collector (`job-analyzer:8080/metrics`, `llama-cpp:8080/metrics` quando disponibile).
 
 Metriche pipeline FSM esportate (via OTel Collector):
 - `rwct_pipeline_queue_items{queue,pipeline_stage,state}`: elementi nelle code SQLite (`analyzer_queue`/`dispatch_queue`) per stato (`QUEUED`,`LEASED`,`DONE`).

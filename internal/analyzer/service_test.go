@@ -98,6 +98,66 @@ func TestCallLLMDoesNotIncludeEnableThinkingWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestCallLLMIncludesStrictJSONSchemaWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"role\":\"Software Engineer\"}"}}]}`))
+	}))
+	defer srv.Close()
+
+	svc := &Service{
+		cfg:  Config{LLMEndpoint: srv.URL, LLMModel: "test-model", LLMStrictJSON: true},
+		http: &http.Client{Timeout: time.Second},
+	}
+
+	if _, err := svc.callLLM(context.Background(), "prompt", 123); err != nil {
+		t.Fatalf("callLLM returned error: %v", err)
+	}
+	if _, ok := got["response_format"]; !ok {
+		t.Fatalf("expected response_format in request, got %#v", got)
+	}
+	if _, ok := got["json_schema"]; !ok {
+		t.Fatalf("expected json_schema in request, got %#v", got)
+	}
+}
+
+func TestCallLLMOmitsStrictJSONSchemaWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"role\":\"Software Engineer\"}"}}]}`))
+	}))
+	defer srv.Close()
+
+	svc := &Service{
+		cfg:  Config{LLMEndpoint: srv.URL, LLMModel: "test-model", LLMStrictJSON: false},
+		http: &http.Client{Timeout: time.Second},
+	}
+
+	if _, err := svc.callLLM(context.Background(), "prompt", 123); err != nil {
+		t.Fatalf("callLLM returned error: %v", err)
+	}
+	if _, ok := got["response_format"]; ok {
+		t.Fatalf("expected response_format omitted, got %#v", got["response_format"])
+	}
+	if _, ok := got["json_schema"]; ok {
+		t.Fatalf("expected json_schema omitted, got %#v", got["json_schema"])
+	}
+}
+
 func TestAnalyzeIncludesSourcePageBodyInPrompt(t *testing.T) {
 	t.Parallel()
 

@@ -44,6 +44,11 @@ processors:
       - key: deployment.environment.name
         value: ${env:DEPLOY_ENV}
         action: upsert
+  filter/logs_min_info:
+    error_mode: ignore
+    logs:
+      log_record:
+        - severity_number < 9
   memory_limiter:
     check_interval: 2s
     limit_mib: 512
@@ -98,7 +103,7 @@ service:
       exporters: [prometheus, otlp_http/grafana_cloud]
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, resource/enrich_env, transform/enrich, batch]
+      processors: [memory_limiter, resource/enrich_env, transform/enrich, filter/logs_min_info, batch]
       exporters: [otlp_http/grafana_cloud]
     traces:
       receivers: [otlp]

@@ -468,12 +468,12 @@ func (s *Service) pollOneWithMode(ctx context.Context, feedURL string, force boo
 			itemSpan.End()
 			continue
 		}
-		if !inserted {
-			slog.Info("duplicate item skipped", "feed_url", feedURL, "guid", item.GUID, "url", item.Link, "title", item.Title, "item_hash", evt.ID)
-			s.itemsDuplicate.Add(itemCtx, 1)
-			itemSpan.End()
-			continue
-		}
+			if !inserted {
+				slog.Debug("duplicate item skipped", "feed_url", feedURL, "guid", item.GUID, "url", item.Link, "title", item.Title, "item_hash", evt.ID)
+				s.itemsDuplicate.Add(itemCtx, 1)
+				itemSpan.End()
+				continue
+			}
 		if err := s.enqueueAnalyzerJob(evt); err != nil {
 			slog.Error("enqueue raw failed", "feed_url", feedURL, "item_id", evt.ID, "err", err)
 			itemSpan.RecordError(err)

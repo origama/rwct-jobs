@@ -7,7 +7,7 @@
 
 {{- if .TechStack }}
 
-🧩 *Stack:* {{- range $i, $v := .TechStack }}{{ if $i }}, {{ end }}#{{ md $v }}{{- end }}
+🧩 *Stack:*{{- range $v := .TechStack }}{{- $tag := tgtag $v }}{{- if $tag }} #{{ $tag }}{{- end }}{{- end }}
 {{- end }}
 
 {{- if .SummaryIT }}
@@ -22,7 +22,7 @@
 └ ⭐ {{ .JobPostQualityRank }} ({{ .JobPostQualityScore }}/100)
 
 {{- if .Tags }}
-🏷 {{- range $i, $t := .Tags }}{{ if $i }} {{ end }}#{{ md $t }}{{- end }}
+🏷 {{- range $t := .Tags }}{{- $tag := tgtag $t }}{{- if $tag }} #{{ $tag }}{{- end }}{{- end }}
 {{- end }}
 
 🔗 [candidati]({{ .SourceURL }})

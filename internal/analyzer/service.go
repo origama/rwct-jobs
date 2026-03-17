@@ -1622,34 +1622,16 @@ func normalizeTag(v string) string {
 	if v == "" {
 		return ""
 	}
-	mapped := strings.Map(func(r rune) rune {
+	// Telegram hashtags break on separators like spaces or '-',
+	// so keep only letters and digits and drop separators/punctuation.
+	return strings.Map(func(r rune) rune {
 		switch {
 		case unicode.IsLetter(r), unicode.IsDigit(r):
 			return unicode.ToLower(r)
-		case r == ' ' || r == '-' || r == '_':
-			return '-'
 		default:
 			return -1
 		}
 	}, v)
-	if mapped == "" {
-		return ""
-	}
-	var b strings.Builder
-	prevDash := false
-	for _, r := range mapped {
-		if r == '-' {
-			if prevDash {
-				continue
-			}
-			prevDash = true
-			b.WriteRune(r)
-			continue
-		}
-		prevDash = false
-		b.WriteRune(r)
-	}
-	return strings.Trim(b.String(), "-")
 }
 
 func computeJobPostQuality(out events.AnalyzedJob) (score int, rank string, missing []string) {

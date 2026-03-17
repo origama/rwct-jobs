@@ -490,8 +490,33 @@ func TestParseAnalyzedJobComputesQualityRankingWithoutHallucinatingMissingFields
 	if out.JobPostMissing[0] != "seniority" || out.JobPostMissing[1] != "salary" {
 		t.Fatalf("unexpected missing field list: %#v", out.JobPostMissing)
 	}
-	if len(out.Tags) != 3 || out.Tags[0] != "go" || out.Tags[1] != "kubernetes" || out.Tags[2] != "remote-eu" {
+	if len(out.Tags) != 3 || out.Tags[0] != "go" || out.Tags[1] != "kubernetes" || out.Tags[2] != "remoteeu" {
 		t.Fatalf("unexpected sanitized tags: %#v", out.Tags)
+	}
+}
+
+func TestNormalizeTagRemovesTelegramBreakingSeparators(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{in: "Remote EU", want: "remoteeu"},
+		{in: "full-time", want: "fulltime"},
+		{in: "go_lang", want: "golang"},
+		{in: "#C++", want: "c"},
+		{in: "   ", want: ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			got := normalizeTag(tc.in)
+			if got != tc.want {
+				t.Fatalf("normalizeTag(%q)=%q want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 

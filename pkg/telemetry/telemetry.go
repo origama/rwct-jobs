@@ -277,6 +277,9 @@ func (h *fanoutHandler) Enabled(ctx context.Context, level slog.Level) bool {
 func (h *fanoutHandler) Handle(ctx context.Context, rec slog.Record) error {
 	var errs []error
 	for _, item := range h.handlers {
+		if !item.Enabled(ctx, rec.Level) {
+			continue
+		}
 		if err := item.Handle(ctx, rec.Clone()); err != nil {
 			errs = append(errs, err)
 		}

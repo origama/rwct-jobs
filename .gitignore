@@ -2,5 +2,6 @@
 .env.*
 !.env.example
 !.env.secrets.example
+docs/production-access.md
 models/
 .data/

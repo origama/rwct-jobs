@@ -20,12 +20,15 @@
 - Consumo da `analyzer_queue` con claim/release/complete persistenti.
 - Chiamata LLM via endpoint OpenAI-compatible (`/v1/chat/completions`).
 - Estrazione campi job strutturati in JSON.
+- Structured output strict JSON Schema (`response_format` + `json_schema`) configurabile via `ANALYZER_LLM_STRICT_JSON`.
 - Propagazione link/immagini originali nel payload analizzato.
 - Modalita` `thinking` configurabile (`LLM_THINKING_ENABLED`).
 - Anti-allucinazione nel prompt: uso solo dati espliciti presenti negli input.
 - Ranking qualita` annuncio basato sulla presenza chiara di campi chiave.
 - Source-enrichment configurabile (`ANALYZER_SOURCE_EXTRACTOR=off|basic|scrapling|hybrid`) con fallback al solo feed in caso di errore.
+- Source-enrichment Scrapling orientato a output markdown (non HTML raw) da passare all'LLM.
 - Quarantena item poison dopo soglia tentativi (`ANALYZER_MAX_DELIVERY_ATTEMPTS`).
+- Telemetria GenAI semconv su span/metriche (`gen_ai.client.operation.duration`, `gen_ai.client.token.usage`, `gen_ai.request.*`, `gen_ai.response.*`, `gen_ai.usage.*`, `error.type`).
 
 ### Backlog
 - Fallback opzionale di source-enrichment via browser headless (feature flag) per domini protetti da anti-bot/JS challenge, con rate limit stretto e cache.
@@ -48,13 +51,15 @@
 ### Attuali
 - Gestione feed: add/remove/enable/disable.
 - Trigger force-poll feed.
+- Layout con sidebar sinistra collassabile e registro viste estendibile.
+- Vista `Feeds & Items` per gestione feed e azioni item.
+- Vista `Pipeline Board` a lane FIFO per stati queue-first (`raw_backlog`, `raw_inflight`, `analyzed_backlog`, `analyzed_inflight`, `failed`, `anomalies`).
 - Dashboard pipeline con backlog/inflight per queue raw/analyzed.
 - Widget analyzer runtime (modello, endpoint, timeout, token, thinking, limiti operativi).
-- Requeue item analizzati.
+- Requeue con routing automatico (`mode=analyzed` verso `dispatch_queue`, `mode=raw` verso `analyzer_queue` quando manca payload analizzato).
 - Visualizzazione payload processato con JSON formattato.
 
 ### Backlog
-- Webview multi-scheda con viste operative dedicate per item per feed, item per queue e item per stato.
 - Ottimizzazione query dashboard per ridurre pattern N+1.
 - Hardening sicurezza endpoint mutativi per uso non-locale.
 
@@ -64,6 +69,7 @@
 - Profilo `prod` con serving modello GGUF locale.
 - Parametri modello configurabili via env.
 - Supporto toggle `thinking` inoltrato dal servizio analyzer quando abilitato.
+- Endpoint Prometheus `/metrics` abilitabile via `LLAMA_ENABLE_METRICS` (`--metrics`).
 
 ### Backlog
 - Validazione periodica di compatibilita` con ultime release disponibili di `llama.cpp`.

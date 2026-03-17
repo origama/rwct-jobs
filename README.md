@@ -104,9 +104,18 @@ Metriche pipeline FSM esportate (via OTel Collector):
 - `rwct_pipeline_items_by_status{status}`: elementi `rss_items` per stato business (`NEW`,`ANALYZED`,`DISPATCHED`,`FAILED`).
 - `rwct_pipeline_items_by_queue_state{queue_state}`: stato derivato usato nel monitor (`not_enqueued_raw`,`queued_raw`,`inflight_raw`,`processed_raw`,`not_enqueued_analyzed`,`queued_analyzed`,`dispatched`,`failed`,`unknown`).
 
+Metriche GenAI (analyzer):
+- `gen_ai.client.operation.duration{gen_ai.operation.name,gen_ai.provider.name,gen_ai.request.model,error.type}`.
+- `gen_ai.client.token.usage{gen_ai.operation.name,gen_ai.provider.name,gen_ai.request.model,gen_ai.token.type}`.
+
+Span GenAI (analyzer):
+- span client LLM con attributi `gen_ai.request.*`, `gen_ai.response.*`, `gen_ai.usage.*`, `error.type` e `server.*`.
+
 Dashboard provisionata automaticamente:
 - `RWCT Observability Overview` (Grafana folder `RWCT`)
 - file: `observability/grafana/dashboards/rwct-overview.json`
+- `RWCT Pipeline FSM` (Grafana folder `RWCT`)
+- file: `observability/grafana/dashboards/rwct-pipeline-fsm.json`
 
 ## Telegram
 
@@ -129,10 +138,16 @@ Template:
 
 - URL: `http://localhost:8090` (`WEB_ADMIN_PORT` per override)
 - Funzioni principali:
-- gestione feed (`add/remove/enable/disable/force poll`)
-- monitor queue e pipeline (`raw/analyzed backlog/inflight`, stuck detectors)
-- pannello analyzer runtime (modello attivo, thinking, timeout, max tokens, rate)
-- requeue di item analizzati e visualizzazione JSON processato
+- layout con sidebar sinistra collassabile e registry viste estendibile.
+- vista `Feeds & Items`: gestione feed (`add/remove/enable/disable/force poll`) e azioni item.
+- vista `Pipeline Board`: lane Kanban FIFO per `raw_backlog`, `raw_inflight`, `analyzed_backlog`, `analyzed_inflight`, `failed`, `anomalies`.
+- toggle auto-refresh board (default 5s).
+- monitor queue e pipeline con metriche di stuck detector.
+- pannello analyzer runtime (modello attivo, thinking, timeout, max tokens, rate).
+- requeue intelligente:
+- se `analyzed_payload_json` esiste: enqueue in `dispatch_queue` (`mode=analyzed`).
+- se manca: enqueue in `analyzer_queue` (`mode=raw`).
+- visualizzazione JSON analizzato.
 
 ## Troubleshooting
 

@@ -62,7 +62,10 @@ stateDiagram-v2
     NEW --> FAILED: analyzer markItemStatus (analysis error)
     ANALYZED --> DISPATCHED: dispatcher markItemStatus
     ANALYZED --> FAILED: dispatcher markItemStatus (deliver error)
-    DISPATCHED --> ANALYZED: web-admin requeue analyzed payload
+    DISPATCHED --> ANALYZED: web-admin requeue (mode=analyzed)
+    DISPATCHED --> NEW: web-admin requeue (mode=raw)
+    FAILED --> NEW: web-admin requeue (mode=raw)
+    FAILED --> ANALYZED: web-admin requeue (mode=analyzed)
 ```
 
 Note:
@@ -90,13 +93,20 @@ sequenceDiagram
     participant UI as web-admin UI
     participant API as web-admin API
     participant DB as sqlite
+    participant A as job-analyzer
     participant D as message-dispatcher
 
     UI->>API: POST /api/db/items/requeue {id}
     API->>DB: read analyzed_payload_json
-    API->>DB: UPSERT dispatch_queue(state=QUEUED,payload=analyzed)
-    API->>DB: UPDATE rss_items(status=ANALYZED, dispatched_at=NULL)
-    D->>DB: CLAIM dispatch_queue -> LEASED
-    D->>DB: COMPLETE -> DONE + rss_items=DISPATCHED
+    alt analyzed payload presente
+        API->>DB: UPSERT dispatch_queue(state=QUEUED,payload=analyzed)
+        API->>DB: UPDATE rss_items(status=ANALYZED, dispatched_at=NULL)
+        D->>DB: CLAIM dispatch_queue -> LEASED
+        D->>DB: COMPLETE -> DONE + rss_items=DISPATCHED
+    else analyzed payload assente
+        API->>DB: UPSERT analyzer_queue(state=QUEUED,payload=raw)
+        API->>DB: UPDATE rss_items(status=NEW, dispatched_at=NULL)
+        A->>DB: CLAIM analyzer_queue -> LEASED
+        A->>DB: COMPLETE -> DONE + dispatch_queue=QUEUED + rss_items=ANALYZED
+    end
 ```
-

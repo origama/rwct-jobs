@@ -1,53 +1,48 @@
-# Scrapling Integration Plan (Experiment)
+# Scrapling Integration (Current State)
 
-## Obiettivo
-Ridurre i fallimenti di source-enrichment nel `job-analyzer` quando la pagina sorgente e` protetta da JS challenge/anti-bot o richiede rendering dinamico.
+## Stato
+L'integrazione Scrapling e` implementata in produzione locale del progetto.
 
-## Punto di integrazione
-Il punto unico da estendere e` la funzione di estrazione testo pagina sorgente:
-- `internal/analyzer/service.go`: `fetchSourcePageExcerpt(...)`
+- Punto di integrazione analyzer: `internal/analyzer/service.go` (`fetchSourcePageExcerpt(...)`).
+- Sidecar Python: `sidecars/scrapling_sidecar/app.py`.
+- Strategia runtime: `ANALYZER_SOURCE_EXTRACTOR=off|basic|scrapling|hybrid`.
+- Strategia consigliata: `hybrid` (basic first, fallback scrapling su errore o testo corto).
 
-L'orchestrazione `analyze(...)` resta invariata (stesso fallback finale al solo feed in caso errore).
+## Comportamento implementato
 
-## Strategia proposta
-Introdurre una strategia configurabile di estrazione:
-- `off`: disabilita source-enrichment (solo dati feed)
-- `basic`: comportamento attuale (HTTP GET + strip HTML)
-- `scrapling`: usa sidecar Scrapling via HTTP
-- `hybrid` (consigliata): prova `basic`, fallback a `scrapling` su errore o estratto troppo povero
-
-## Perche' sidecar (e non embedding diretto)
-`Scrapling` e` una libreria Python con dipendenze/runtime dedicati. Tenerla in sidecar:
-- evita di complicare il container Go dell'analyzer
-- rende piu' semplice tuning indipendente (timeout, retries, browser deps)
-- permette rollout graduale senza cambiare il path principale del servizio
+- `off`: nessun source enrichment.
+- `basic`: HTTP GET + estrazione testo da HTML.
+- `scrapling`: chiamata sidecar `/extract`.
+- `hybrid`:
+- prova `basic`.
+- se `basic` fallisce o produce testo sotto soglia (`ANALYZER_SOURCE_MIN_CHARS_FOR_BASIC`), prova `scrapling`.
+- se `scrapling` fallisce e `basic` aveva prodotto testo non vuoto, mantiene `basic` best effort.
 
 ## Contratto HTTP analyzer -> scrapling-sidecar
+
 Endpoint:
 - `POST /extract`
 
 Request JSON:
+
 ```json
 {
   "url": "https://example.com/jobs/123",
-  "timeout_ms": 7000,
-  "max_chars": 2500,
+  "timeout_ms": 8000,
+  "max_chars": 10000,
   "mode": "auto",
   "user_agent": "rwct-agent-analyzer/1.0 (+source-page-scraper)"
 }
 ```
 
-Note:
-- `mode` inizialmente `auto` (la logica nel sidecar decide static/dynamic/stealthy)
-- `max_chars` deve allinearsi al clamp attuale in analyzer (2500)
+Response JSON:
 
-Response JSON (success):
 ```json
 {
   "ok": true,
-  "text": "...estratto normalizzato...",
+  "text": "...markdown estratto...",
   "final_url": "https://example.com/jobs/123",
-  "method": "dynamic",
+  "method": "static",
   "status_code": 200,
   "duration_ms": 1840,
   "blocked": false,
@@ -55,78 +50,31 @@ Response JSON (success):
 }
 ```
 
-Response JSON (errore):
-```json
-{
-  "ok": false,
-  "text": "",
-  "final_url": "https://example.com/jobs/123",
-  "method": "stealthy",
-  "status_code": 403,
-  "duration_ms": 2200,
-  "blocked": true,
-  "error": "challenge/blocked"
-}
-```
+Note:
+- `text` e` markdown normalizzato (non HTML raw), con focus sul contenuto principale quando rilevabile.
+- in caso errore il sidecar risponde con `ok=false` e `error` valorizzato.
 
-## Nuove env var (analyzer)
+## Variabili env rilevanti
+
 - `ANALYZER_SOURCE_EXTRACTOR=off|basic|scrapling|hybrid` (default `basic`)
-- `ANALYZER_SOURCE_MIN_CHARS_FOR_BASIC=220` (solo per `hybrid`)
+- `ANALYZER_SOURCE_MIN_CHARS_FOR_BASIC=220`
 - `ANALYZER_SCRAPLING_ENDPOINT=http://scrapling-sidecar:8088`
 - `ANALYZER_SCRAPLING_TIMEOUT=8s`
-- `ANALYZER_SCRAPLING_MAX_CHARS=2500`
+- `ANALYZER_SCRAPLING_MAX_CHARS=10000`
 
-Comportamento:
-- `off`: nessuna chiamata di source extraction 
-- altri valori: usa la strategia configurata da `ANALYZER_SOURCE_EXTRACTOR`
+## Osservabilita`
 
+- Sidecar instrumentato OTel (tracce, metriche, log) verso collector.
+- Metriche lato sidecar:
+- `rwct_scrapling_extract_requests_total{result}`
+- `rwct_scrapling_extract_duration_ms{result}`
 
-## Regole di fallback (hybrid)
-1. Tenta `basic`
-2. Se `basic` fallisce, prova `scrapling`
-3. Se `basic` ha successo ma `len(text) < ANALYZER_SOURCE_MIN_CHARS_FOR_BASIC`, prova `scrapling`
-4. Se anche `scrapling` fallisce, log warn e continua con solo feed
+## Limiti noti
 
-## Log e osservabilita' minime
-Aggiungere campi strutturati nel warn/info di scraping:
-- `extractor_strategy`
-- `extractor_method` (`basic`, `static`, `dynamic`, `stealthy`)
-- `extractor_latency_ms`
-- `extractor_chars`
-- `extractor_fallback_used`
-- `source_domain`
+- Alcuni siti anti-bot/JS challenge possono ancora degradare l'estrazione (`salary` o dettagli secondari mancanti).
+- La qualita` del markdown dipende dalla struttura HTML della pagina sorgente.
 
-## Rollout esperimento in branch
-Fase 1 (shadow mode):
-- analyzer usa ancora `basic` nel prompt
-- chiama scrapling in parallelo solo per metriche/comparazione (senza impatto output)
+## Prossimi miglioramenti
 
-Fase 2 (active hybrid):
-- `ANALYZER_SOURCE_EXTRACTOR=hybrid`
-- l'output scrapling entra nel prompt solo nei casi di fallback
-
-## Criteri di successo (go/no-go)
-Confronto su stesso set feed/domìni problematici:
-- aumento pagine con estratto utile (`chars >= 220`): target `+20%`
-- riduzione warning scraping failed: target `-30%`
-- incremento latenza media analyze per item: massimo `+20%`
-- nessun aumento significativo di item `FAILED`
-
-## Test minimi da aggiungere
-- Unit: selector strategia (`off/basic/scrapling/hybrid`)
-- Unit: fallback `hybrid` su errore e su testo corto
-- Unit: parser response sidecar + gestione errori timeout/status
-- Integration: fake sidecar HTTP nel test analyzer
-
-## Impatto su docker-compose (quando implementiamo)
-Aggiungere servizio:
-- `scrapling-sidecar` su porta interna `8088`
-- dipendenze Python/Playwright secondo runtime scelto
-
-`job-analyzer`:
-- dipendenza health su sidecar solo se `ANALYZER_SOURCE_EXTRACTOR` include scrapling
-
-## Decisioni aperte da confermare prima del coding
-1. Threshold testo corto: `220` caratteri va bene come default?
-2. In Fase 1 shadow mode vogliamo campionamento (`10%-30%`) o sempre-on?
-3. In caso timeout sidecar, preferiamo retry singolo o fail-fast?
+- Estrazione selettiva piu` aggressiva di sezioni compensation/benefit su domini noti.
+- Eventuale fallback headless dedicato dietro feature flag su domini problematici.

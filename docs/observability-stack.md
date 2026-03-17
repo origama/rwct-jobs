@@ -9,6 +9,7 @@ Tutti i componenti applicativi inviano segnali OpenTelemetry all'istanza locale 
 - Log: OTel SDK/bridge slog -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
 - Tracce: OTel SDK -> OTLP gRPC -> `otel-collector` -> OTLP/HTTP -> Grafana Cloud OTLP Gateway
 - Metriche host: receiver `hostmetrics` nel collector (CPU, memoria, disco/filesystem, rete, paging, process count)
+- Enrichment resource nel collector: `deployment.environment.name=${DEPLOY_ENV}` su metriche/log/tracce.
 
 L'endpoint di destinazione e`:
 `https://otlp-gateway-prod-eu-west-0.grafana.net/otlp`
@@ -32,6 +33,18 @@ Il contesto viene propagato lungo pipeline asincrona via payload JSON:
 
 Questo consente di seguire il flusso distribuito:
 `rss-reader -> job-analyzer -> message-dispatcher`.
+
+## Semconv GenAI (analyzer)
+
+Il servizio `job-analyzer` espone telemetria GenAI semconv per le chiamate LLM:
+
+- Metriche:
+- `gen_ai.client.operation.duration{gen_ai.operation.name,gen_ai.provider.name,gen_ai.request.model,error.type}`
+- `gen_ai.client.token.usage{gen_ai.operation.name,gen_ai.provider.name,gen_ai.request.model,gen_ai.token.type}`
+- Span:
+- span client per operazione chat con attributi request/response/usage (`gen_ai.request.*`, `gen_ai.response.*`, `gen_ai.usage.*`) e `error.type`.
+
+Sono mantenute anche metriche legacy applicative (`rwct_*`) per compatibilita` dashboard.
 
 ## Avvio locale
 
@@ -64,6 +77,7 @@ Tracce/log/metriche:
 
 - verifica su Grafana Cloud (Explore/Traces/Metrics/Logs).
 - metriche host utili da cercare: `system.cpu.*`, `system.memory.*`, `system.filesystem.*`, `system.network.*`, `system.paging.*`, `system.processes.*`
+- metriche GenAI utili da cercare: `gen_ai.client.operation.duration`, `gen_ai.client.token.usage`
 - metriche FSM pipeline:
   - `rwct_pipeline_queue_items{queue,pipeline_stage,state}`
   - `rwct_pipeline_items_by_status{status}`
@@ -97,3 +111,4 @@ Nota sul profilo `obs`:
 - Grafana datasources: `observability/grafana/provisioning/datasources/datasources.yaml`
 - Grafana dashboards: `observability/grafana/provisioning/dashboards/dashboards.yaml`
 - Dashboard overview: `observability/grafana/dashboards/rwct-overview.json`
+- Dashboard pipeline FSM: `observability/grafana/dashboards/rwct-pipeline-fsm.json`

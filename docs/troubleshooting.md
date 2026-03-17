@@ -11,7 +11,7 @@ Sintomi:
 
 ```bash
 curl -sS http://localhost:8090/api/monitor/queues | jq '.queues,.pipeline'
-docker logs --since 10m rwct-agent-job-analyzer-3
+docker compose logs --since 10m job-analyzer
 ```
 
 ### 2) Sblocco immediato (quarantena item stantii)
@@ -123,4 +123,3 @@ docker builder prune -af
 
 - Reset di Docker Desktop data (cancella immagini/container/volumi locali).
 - Ripristinare il DB da backup (`rss-reader.db.bak.*`) nel volume `rwct-agent_rwct-data`.
-

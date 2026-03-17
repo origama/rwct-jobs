@@ -14,6 +14,7 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -119,9 +120,11 @@ func New(cfg Config) (*Service, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	tpl, err := template.New("dispatch").Funcs(template.FuncMap{
-		"md": escapeMarkdownText,
-	}).Parse(content)
+	templateFuncs := template.FuncMap{
+		"md":    escapeMarkdownText,
+		"tgtag": sanitizeTelegramHashtag,
+	}
+	tpl, err := template.New("dispatch").Funcs(templateFuncs).Parse(content)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -134,9 +137,7 @@ func New(cfg Config) (*Service, error) {
 			_ = db.Close()
 			return nil, fmt.Errorf("read telegram template failed: %w", err)
 		}
-		tplTG, err = template.New("dispatch-telegram").Funcs(template.FuncMap{
-			"md": escapeMarkdownText,
-		}).Parse(string(b))
+		tplTG, err = template.New("dispatch-telegram").Funcs(templateFuncs).Parse(string(b))
 		if err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("parse telegram template failed: %w", err)
@@ -611,6 +612,21 @@ func escapeMarkdownText(s string) string {
 		"`", "\\`",
 	)
 	return r.Replace(s)
+}
+
+func sanitizeTelegramHashtag(s string) string {
+	s = strings.TrimSpace(strings.TrimPrefix(s, "#"))
+	if s == "" {
+		return ""
+	}
+	return strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r):
+			return unicode.ToLower(r)
+		default:
+			return -1
+		}
+	}, s)
 }
 
 func (s *Service) publishError(itemID string, attempt int, code string, err error) {

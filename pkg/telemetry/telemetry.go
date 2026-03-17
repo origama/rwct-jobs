@@ -94,6 +94,7 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (*slog.Logger, Shutdown
 			baseHandler,
 			otelHandler,
 		},
+		level: cfg.Level,
 	}).With("service", cfg.ServiceName)
 
 	return logger, runtime.Shutdown, nil
@@ -263,9 +264,13 @@ func InitMetrics(ctx context.Context, endpoint string) (Shutdown, error) {
 
 type fanoutHandler struct {
 	handlers []slog.Handler
+	level    slog.Leveler
 }
 
 func (h *fanoutHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	if h.level != nil && level < h.level.Level() {
+		return false
+	}
 	for _, item := range h.handlers {
 		if item.Enabled(ctx, level) {
 			return true
@@ -275,6 +280,9 @@ func (h *fanoutHandler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h *fanoutHandler) Handle(ctx context.Context, rec slog.Record) error {
+	if h.level != nil && rec.Level < h.level.Level() {
+		return nil
+	}
 	var errs []error
 	for _, item := range h.handlers {
 		if !item.Enabled(ctx, rec.Level) {
@@ -292,7 +300,7 @@ func (h *fanoutHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	for _, item := range h.handlers {
 		next = append(next, item.WithAttrs(attrs))
 	}
-	return &fanoutHandler{handlers: next}
+	return &fanoutHandler{handlers: next, level: h.level}
 }
 
 func (h *fanoutHandler) WithGroup(name string) slog.Handler {
@@ -300,5 +308,5 @@ func (h *fanoutHandler) WithGroup(name string) slog.Handler {
 	for _, item := range h.handlers {
 		next = append(next, item.WithGroup(name))
 	}
-	return &fanoutHandler{handlers: next}
+	return &fanoutHandler{handlers: next, level: h.level}
 }

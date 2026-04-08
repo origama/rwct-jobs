@@ -849,6 +849,7 @@ Campi da valorizzare con massima priorita' (se presenti): seniority, location, c
 Mantieni tech_stack breve: massimo 8 tecnologie reali, senza inventare valori.
 tags: array di 3-6 tag distintivi, minuscoli, senza #, max 24 caratteri per tag (es: go, kubernetes, remote, fintech, full-time).
 summary_it: una sola frase, massimo 220 caratteri.
+confidence: numero tra 0 e 1 (0 = molto incerto, 1 = molto sicuro).
 Per job_category usa SOLO una di queste categorie esatte:
 %s
 Se non è classificabile, usa esattamente: Altri ruoli.
@@ -879,6 +880,7 @@ Vincoli:
 - tech_stack massimo 8 elementi
 - tags: 3-6 valori lowercase, senza #, max 24 caratteri ciascuno
 - summary_it massimo 220 caratteri
+- confidence deve essere un numero tra 0 e 1
 
 Titolo: %s
 URL: %s
@@ -1048,74 +1050,30 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	reqBody := map[string]any{
-		"model": s.cfg.LLMModel,
-		"messages": []map[string]string{
-			{"role": "system", "content": "Sei un analizzatore annunci lavoro. Rispondi solo JSON valido."},
-			{"role": "user", "content": prompt},
-		},
-		"temperature": 0.1,
-		"max_tokens":  maxTokens,
+	r, err := s.doLLMRequest(reqCtx, s.buildLLMRequestBody(prompt, maxTokens, llmRequestOptions{
+		StrictJSON: s.cfg.LLMStrictJSON,
+	}))
+	if err != nil && s.cfg.LLMStrictJSON && isSamplerInitHTTPError(err) {
+		span.SetAttributes(attribute.Bool("llm.structured_output_retry", true))
+		slog.Warn("llama.cpp rejected structured output; retrying without strict json", "model", s.cfg.LLMModel, "err", err)
+		r, err = s.doLLMRequest(reqCtx, s.buildLLMRequestBody(prompt, maxTokens, llmRequestOptions{
+			DisableThinking: !s.cfg.LLMThinking,
+		}))
 	}
-	if s.cfg.LLMThinking {
-		reqBody["enable_thinking"] = true
-	}
-	if s.cfg.LLMStrictJSON {
-		schema := analyzedJobJSONSchema()
-		reqBody["response_format"] = map[string]any{
-			"type":   "json_schema",
-			"schema": schema,
-		}
-		// Fallback for llama.cpp implementations that map json_schema directly to grammar-based sampling.
-		reqBody["json_schema"] = schema
-	}
-	body, _ := json.Marshal(reqBody)
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(s.cfg.LLMEndpoint, "/")+"/v1/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		opErrorType = "request_create_error"
-		setSpanError(span, err, opErrorType)
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.http.Do(req)
 	if err != nil {
 		opErrorType = normalizeLLMErrorType(err)
+		if isHTTPError(err) {
+			opErrorType = "http_error"
+		}
 		setSpanError(span, err, opErrorType)
+		var httpErr llmHTTPError
+		if errors.As(err, &httpErr) {
+			span.SetAttributes(attribute.Int("http.status_code", httpErr.StatusCode))
+		}
 		return "", err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		err := fmt.Errorf("llm status: %d", resp.StatusCode)
-		opErrorType = "http_error"
-		setSpanError(span, err, opErrorType)
-		span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
-		return "", err
-	}
-
-	var r struct {
-		ID      string `json:"id"`
-		Model   string `json:"model"`
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
-		Usage struct {
-			PromptTokens     int64 `json:"prompt_tokens"`
-			CompletionTokens int64 `json:"completion_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+	if err := validateLLMResponse(r); err != nil {
 		opErrorType = "response_decode_error"
-		setSpanError(span, err, opErrorType)
-		return "", err
-	}
-	if len(r.Choices) == 0 {
-		err := errors.New("empty llm response")
-		opErrorType = "empty_response"
 		setSpanError(span, err, opErrorType)
 		return "", err
 	}
@@ -1151,6 +1109,119 @@ func (s *Service) callLLM(ctx context.Context, prompt string, maxTokens int) (st
 	s.recordGenAITokenUsage(ctx, "input", r.Usage.PromptTokens, s.cfg.LLMModel)
 	s.recordGenAITokenUsage(ctx, "output", r.Usage.CompletionTokens, s.cfg.LLMModel)
 	return stripMarkdownCodeFence(strings.TrimSpace(r.Choices[0].Message.Content)), nil
+}
+
+type llmRequestOptions struct {
+	StrictJSON      bool
+	DisableThinking bool
+}
+
+type llmHTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e llmHTTPError) Error() string {
+	body := strings.TrimSpace(e.Body)
+	if body == "" {
+		return fmt.Sprintf("llm status: %d", e.StatusCode)
+	}
+	if len(body) > 240 {
+		body = body[:240] + "..."
+	}
+	return fmt.Sprintf("llm status: %d: %s", e.StatusCode, body)
+}
+
+type llmChatResponse struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+	} `json:"usage"`
+}
+
+func (s *Service) buildLLMRequestBody(prompt string, maxTokens int, opts llmRequestOptions) map[string]any {
+	reqBody := map[string]any{
+		"model": s.cfg.LLMModel,
+		"messages": []map[string]string{
+			{"role": "system", "content": "Sei un analizzatore annunci lavoro. Rispondi solo JSON valido."},
+			{"role": "user", "content": prompt},
+		},
+		"temperature": 0.1,
+		"max_tokens":  maxTokens,
+	}
+	if s.cfg.LLMThinking {
+		reqBody["enable_thinking"] = true
+	}
+	if opts.DisableThinking {
+		reqBody["chat_template_kwargs"] = map[string]bool{"enable_thinking": false}
+		reqBody["reasoning_format"] = "none"
+	}
+	if opts.StrictJSON {
+		schema := analyzedJobJSONSchema()
+		reqBody["response_format"] = map[string]any{
+			"type":   "json_schema",
+			"schema": schema,
+		}
+		// Fallback for llama.cpp implementations that map json_schema directly to grammar-based sampling.
+		reqBody["json_schema"] = schema
+	}
+	return reqBody
+}
+
+func (s *Service) doLLMRequest(ctx context.Context, reqBody map[string]any) (llmChatResponse, error) {
+	body, _ := json.Marshal(reqBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.cfg.LLMEndpoint, "/")+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return llmChatResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return llmChatResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return llmChatResponse{}, llmHTTPError{StatusCode: resp.StatusCode, Body: string(payload)}
+	}
+
+	var r llmChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return llmChatResponse{}, err
+	}
+	return r, nil
+}
+
+func validateLLMResponse(r llmChatResponse) error {
+	if len(r.Choices) == 0 {
+		return errors.New("empty llm response")
+	}
+	return nil
+}
+
+func isHTTPError(err error) bool {
+	var httpErr llmHTTPError
+	return errors.As(err, &httpErr)
+}
+
+func isSamplerInitHTTPError(err error) bool {
+	var httpErr llmHTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	if httpErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	return strings.Contains(strings.ToLower(httpErr.Body), "failed to initialize samplers")
 }
 
 func (s *Service) computeLLMTimeout(prompt string, maxTokens int) time.Duration {
@@ -1194,8 +1265,19 @@ func (s *Service) computeLLMTimeout(prompt string, maxTokens int) time.Duration 
 }
 
 func parseAnalyzedJob(content string, in events.RawJobItem) (events.AnalyzedJob, error) {
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(content), &raw); err != nil {
+		return events.AnalyzedJob{}, fmt.Errorf("json parse failed: %w; content=%s", err, content)
+	}
+	normalizeAnalyzedJobPayload(raw)
+
+	normalized, err := json.Marshal(raw)
+	if err != nil {
+		return events.AnalyzedJob{}, fmt.Errorf("json normalize failed: %w; content=%s", err, content)
+	}
+
 	var out events.AnalyzedJob
-	if err := json.Unmarshal([]byte(content), &out); err != nil {
+	if err := json.Unmarshal(normalized, &out); err != nil {
 		return events.AnalyzedJob{}, fmt.Errorf("json parse failed: %w; content=%s", err, content)
 	}
 	if out.Role == "" || out.Company == "" || out.SummaryIT == "" {
@@ -1224,6 +1306,66 @@ func parseAnalyzedJob(content string, in events.RawJobItem) (events.AnalyzedJob,
 	}
 	out.CreatedAt = time.Now().UTC()
 	return out, nil
+}
+
+func normalizeAnalyzedJobPayload(raw map[string]any) {
+	if raw == nil {
+		return
+	}
+	if v, ok := normalizeConfidenceValue(raw["confidence"]); ok {
+		raw["confidence"] = v
+	}
+}
+
+func normalizeConfidenceValue(v any) (any, bool) {
+	switch val := v.(type) {
+	case float64, float32, int, int32, int64, uint, uint32, uint64:
+		return v, true
+	case string:
+		text := strings.ToLower(strings.TrimSpace(val))
+		if text == "" {
+			return v, false
+		}
+		if mapped, ok := mapConfidenceLabel(text); ok {
+			return mapped, true
+		}
+		numeric := strings.TrimSuffix(strings.ReplaceAll(text, ",", "."), "%")
+		if n, err := strconv.ParseFloat(numeric, 64); err == nil {
+			if strings.HasSuffix(text, "%") || n > 1 {
+				n = n / 100
+			}
+			return clampConfidence(n), true
+		}
+	}
+	return v, false
+}
+
+func mapConfidenceLabel(v string) (float64, bool) {
+	switch v {
+	case "molto alta", "very high":
+		return 0.95, true
+	case "alta", "alto", "high":
+		return 0.85, true
+	case "media", "medio", "moderata", "medium", "moderate":
+		return 0.6, true
+	case "bassa", "basso", "low":
+		return 0.3, true
+	case "molto bassa", "very low":
+		return 0.1, true
+	default:
+		return 0, false
+	}
+}
+
+func clampConfidence(v float64) float64 {
+	switch {
+	case v < 0:
+		return 0
+	case v > 1:
+		return 1
+	default:
+		return v
+	}
 }
 
 func isTruncatedJSONError(err error) bool {

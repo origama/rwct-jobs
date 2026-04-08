@@ -158,6 +158,70 @@ func TestCallLLMOmitsStrictJSONSchemaWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestCallLLMRetriesWithoutStrictJSONOnSamplerInitError(t *testing.T) {
+	t.Parallel()
+
+	var requests []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var got map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requests = append(requests, got)
+
+		w.Header().Set("Content-Type", "application/json")
+		if len(requests) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Failed to initialize samplers: std::exception","type":"invalid_request_error"}}`))
+			return
+		}
+
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"role\":\"Software Engineer\"}"}}]}`))
+	}))
+	defer srv.Close()
+
+	svc := &Service{
+		cfg: Config{
+			LLMEndpoint:   srv.URL,
+			LLMModel:      "gemma-4-E2B-it-Q4_K_M.gguf",
+			LLMStrictJSON: true,
+			LLMThinking:   false,
+		},
+		http: &http.Client{Timeout: time.Second},
+	}
+
+	got, err := svc.callLLM(context.Background(), "prompt", 123)
+	if err != nil {
+		t.Fatalf("callLLM returned error: %v", err)
+	}
+	if got != `{"role":"Software Engineer"}` {
+		t.Fatalf("unexpected content: %q", got)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(requests))
+	}
+	if _, ok := requests[0]["response_format"]; !ok {
+		t.Fatalf("expected response_format in first request, got %#v", requests[0])
+	}
+	if _, ok := requests[1]["response_format"]; ok {
+		t.Fatalf("expected response_format omitted in retry, got %#v", requests[1]["response_format"])
+	}
+	if _, ok := requests[1]["json_schema"]; ok {
+		t.Fatalf("expected json_schema omitted in retry, got %#v", requests[1]["json_schema"])
+	}
+	if requests[1]["reasoning_format"] != "none" {
+		t.Fatalf("expected reasoning_format=none in retry, got %#v", requests[1]["reasoning_format"])
+	}
+	kwargs, ok := requests[1]["chat_template_kwargs"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected chat_template_kwargs in retry, got %#v", requests[1]["chat_template_kwargs"])
+	}
+	if kwargs["enable_thinking"] != false {
+		t.Fatalf("expected enable_thinking=false in retry kwargs, got %#v", kwargs["enable_thinking"])
+	}
+}
+
 func TestAnalyzeIncludesSourcePageBodyInPrompt(t *testing.T) {
 	t.Parallel()
 
@@ -492,6 +556,76 @@ func TestParseAnalyzedJobComputesQualityRankingWithoutHallucinatingMissingFields
 	}
 	if len(out.Tags) != 3 || out.Tags[0] != "go" || out.Tags[1] != "kubernetes" || out.Tags[2] != "remoteeu" {
 		t.Fatalf("unexpected sanitized tags: %#v", out.Tags)
+	}
+}
+
+func TestParseAnalyzedJobAcceptsNumericConfidenceAsString(t *testing.T) {
+	t.Parallel()
+
+	in := events.RawJobItem{
+		ID:          "quality-test-confidence-string",
+		URL:         "https://example.com/jobs/confidence-string",
+		Title:       "DevOps Engineer",
+		Description: "Ruolo DevOps remoto.",
+	}
+
+	content := `{
+		"job_category":"Programmazione",
+		"role":"DevOps Engineer",
+		"company":"Northstar Data",
+		"seniority":"",
+		"location":"Remote (US/Canada)",
+		"remote_type":"Remote",
+		"tech_stack":["Docker","Kubernetes","RabbitMQ","Redis"],
+		"tags":["devops","kubernetes","docker","remote","fintech"],
+		"contract_type":"Full-Time",
+		"salary":"EUR 115k-140k",
+		"language":"Italiano",
+		"summary_it":"Northstar Data cerca un DevOps Engineer per gestire sistemi distribuiti e CI/CD.",
+		"confidence":"1.0"
+	}`
+
+	out, err := parseAnalyzedJob(content, in)
+	if err != nil {
+		t.Fatalf("parseAnalyzedJob returned error: %v", err)
+	}
+	if out.Confidence != 1.0 {
+		t.Fatalf("expected confidence 1.0, got %v", out.Confidence)
+	}
+}
+
+func TestParseAnalyzedJobMapsQualitativeConfidenceLabel(t *testing.T) {
+	t.Parallel()
+
+	in := events.RawJobItem{
+		ID:          "quality-test-confidence-label",
+		URL:         "https://example.com/jobs/confidence-label",
+		Title:       "DevOps Engineer",
+		Description: "Ruolo DevOps remoto.",
+	}
+
+	content := `{
+		"job_category":"Programmazione",
+		"role":"DevOps Engineer",
+		"company":"Northstar Data",
+		"seniority":"",
+		"location":"Remote (US/Canada)",
+		"remote_type":"Remote",
+		"tech_stack":["Docker","Kubernetes","RabbitMQ","Redis"],
+		"tags":["devops","kubernetes","docker","remote","fintech"],
+		"contract_type":"Full-Time",
+		"salary":"EUR 115k-140k",
+		"language":"Italiano",
+		"summary_it":"Northstar Data cerca un DevOps Engineer per gestire sistemi distribuiti e CI/CD.",
+		"confidence":"alta"
+	}`
+
+	out, err := parseAnalyzedJob(content, in)
+	if err != nil {
+		t.Fatalf("parseAnalyzedJob returned error: %v", err)
+	}
+	if out.Confidence != 0.85 {
+		t.Fatalf("expected confidence 0.85, got %v", out.Confidence)
 	}
 }
 

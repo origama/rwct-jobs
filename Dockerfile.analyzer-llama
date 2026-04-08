@@ -8,7 +8,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /out/service ./cmd/job-analyzer
 
 FROM ubuntu:22.04 AS llama-build
-ARG LLAMA_CPP_REF=b8210
+ARG LLAMA_CPP_REF=b8648
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates git cmake build-essential \
